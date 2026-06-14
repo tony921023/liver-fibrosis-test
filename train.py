@@ -1,14 +1,18 @@
-"""訓練迴圈 + 評估(macro AUROC)。
+"""訓練迴圈 + 評估。
 
 訓練骨架:
   Phase 1「暖身」  凍結 backbone,只訓 head(config.WARMUP_EPOCHS 輪)
   Phase 2「微調」  解凍 backbone,differential LR + LR scheduler 微調到 config.EPOCHS
-  全程       監看 val 指標 → early stopping + 存最佳 checkpoint
+  全程       監看 val 指標 → early stopping + 存最佳 checkpoint(用 val,不碰 test)
+  最後       載回最佳權重,在獨立 test 集評一次:macro AUROC + per-class + QWK + 混淆矩陣
+
+結果輸出(config.RESULTS_DIR):metrics.csv、curves.png、confusion_matrix.png、test_report.json
 
 跑法:  python train.py
 超參數集中在 config.py;要換 backbone / 排程 / 預測目標,改 config 即可。
 
 ⚠️ 評估數字偏樂觀:split 非 patient-level,詳見 dataset.py 的 LEAKAGE 警告。
+test 集只消除「用 val 既選模型又打分」的偏差,消不掉 patient-level leakage。
 """
 
 import os
@@ -16,10 +20,10 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import roc_auc_score
 
 from dataset import get_dataloaders            # 來自 dataset.py
 from model import build_model, set_backbone_trainable, param_groups  # 來自 model.py
+import metrics                                 # 評估指標與結果輸出
 import config                                  # 超參數集中放這
 
 
@@ -46,8 +50,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, num_classes, device):
-    """回傳 (val_loss, macro_auroc)。"""
+def collect(model, loader, criterion, device):
+    """跑一遍 loader,回傳 (avg_loss, probs[N,C], labels[N])。
+
+    供 per-epoch 的 val 評估與最後的 test 完整報告共用。
+    """
     model.eval()
     total_loss = 0.0
     probs, labels = [], []
@@ -57,20 +64,8 @@ def evaluate(model, loader, criterion, num_classes, device):
         total_loss += criterion(logits, y).item() * x.size(0)
         probs.append(torch.softmax(logits, dim=1).cpu().numpy())
         labels.append(y.cpu().numpy())
-    val_loss = total_loss / len(loader.dataset)
-
-    probs = np.concatenate(probs)
-    labels = np.concatenate(labels)
-    # 明確帶 labels=range(num_classes),避免 val 某類別剛好缺漏時報錯;
-    # 二元任務取陽性類機率即可。
-    if num_classes == 2:
-        auroc = roc_auc_score(labels, probs[:, 1])
-    else:
-        auroc = roc_auc_score(
-            labels, probs, multi_class="ovr", average="macro",
-            labels=list(range(num_classes)),
-        )
-    return val_loss, auroc
+    avg_loss = total_loss / len(loader.dataset)
+    return avg_loss, np.concatenate(probs), np.concatenate(labels)
 
 
 def _build_optimizer(model):
@@ -84,7 +79,6 @@ def _build_optimizer(model):
 def _build_scheduler(optimizer, finetune_epochs):
     name = config.SCHEDULER
     if name == "cosine":
-        # T_max 設為 Phase 2 的輪數,讓 LR 在微調期間退火到接近 0
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max(1, finetune_epochs))
     if name == "plateau":
@@ -102,11 +96,12 @@ def main():
     device = get_device()
     print("device:", device, "| torch:", torch.__version__)
 
-    train_loader, val_loader, num_classes = get_dataloaders(config)
+    train_loader, val_loader, test_loader, num_classes, class_names = get_dataloaders(config)
     model = build_model(num_classes, config).to(device)
     criterion = nn.CrossEntropyLoss()
 
     os.makedirs(config.CKPT_DIR, exist_ok=True)
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
     ckpt_path = os.path.join(config.CKPT_DIR, "best.pt")
 
     # --- Phase 1:暖身(凍結 backbone,只訓 head)---
@@ -119,6 +114,7 @@ def main():
     best_metric = -float("inf")
     best_epoch = 0
     epochs_no_improve = 0
+    history = []
 
     for epoch in range(1, config.EPOCHS + 1):
         # --- 進入 Phase 2:解凍 backbone,換 differential-LR optimizer + scheduler ---
@@ -131,10 +127,14 @@ def main():
                   f"(backbone_lr={config.BACKBONE_LR}, head_lr={config.HEAD_LR}) ---")
 
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, auroc = evaluate(model, val_loader, criterion, num_classes, device)
+        val_loss, val_probs, val_labels = collect(model, val_loader, criterion, device)
+        auroc = metrics.macro_auroc(val_labels, val_probs, num_classes)
 
         if scheduler is not None:
             scheduler.step(auroc) if config.SCHEDULER == "plateau" else scheduler.step()
+
+        history.append({"epoch": epoch, "phase": phase, "train_loss": train_loss,
+                        "val_loss": val_loss, "val_macro_auroc": auroc})
 
         improved = auroc > best_metric
         flag = ""
@@ -145,6 +145,7 @@ def main():
                 # 否則 torch>=2.6 的 weights_only=True 預設載入會失敗。
                 {"model_state": model.state_dict(), "epoch": epoch,
                  "metric": float(auroc), "num_classes": num_classes,
+                 "class_names": class_names,
                  "backbone": config.BACKBONE, "task": config.TASK},
                 ckpt_path,
             )
@@ -155,14 +156,39 @@ def main():
         print(f"epoch {epoch:2d} [{phase:8s}]: train_loss={train_loss:.4f}  "
               f"val_loss={val_loss:.4f}  val_macro_auroc={auroc:.4f}{flag}")
 
-        # --- early stopping ---
+        # --- early stopping(只看 val)---
         if config.EARLY_STOP_PATIENCE > 0 and epochs_no_improve >= config.EARLY_STOP_PATIENCE:
             print(f"early stop @ epoch {epoch} "
                   f"(no improvement for {config.EARLY_STOP_PATIENCE} epochs)")
             break
 
-    print(f"best val_macro_auroc={best_metric:.4f} @ epoch {best_epoch}  "
-          f"-> {ckpt_path}")
+    print(f"best val_macro_auroc={best_metric:.4f} @ epoch {best_epoch}  -> {ckpt_path}")
+
+    # --- 存每輪指標與訓練曲線 ---
+    csv_path = os.path.join(config.RESULTS_DIR, "metrics.csv")
+    curves_path = os.path.join(config.RESULTS_DIR, "curves.png")
+    metrics.save_history_csv(history, csv_path)
+    metrics.save_curves(history, curves_path)
+
+    # --- 載回最佳權重,在「獨立 test 集」評一次(這才是要回報的數字)---
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+    _, test_probs, test_labels = collect(model, test_loader, criterion, device)
+    report = metrics.full_report(test_labels, test_probs, class_names)
+
+    print("\n===== TEST 集評估(best checkpoint @ epoch "
+          f"{ckpt['epoch']})=====")
+    print(metrics.format_report(report))
+    print("⚠️ 數字偏樂觀:非 patient-level split,詳見 dataset.py 的 LEAKAGE 警告。")
+
+    metrics.save_report_json(
+        report, os.path.join(config.RESULTS_DIR, "test_report.json"),
+        extra={"best_epoch": int(ckpt["epoch"]), "backbone": config.BACKBONE,
+               "task": config.TASK, "val_macro_auroc_best": float(best_metric)})
+    metrics.save_confusion_png(
+        report, os.path.join(config.RESULTS_DIR, "confusion_matrix.png"))
+    print(f"\n結果已存到 {config.RESULTS_DIR}/:"
+          " metrics.csv, curves.png, confusion_matrix.png, test_report.json")
 
 
 if __name__ == "__main__":

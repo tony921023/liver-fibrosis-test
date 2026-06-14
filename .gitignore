@@ -17,5 +17,6 @@ kaggle.json
 *.key
 runs/
 wandb/
+outputs/
 *.log
 .DS_Store
