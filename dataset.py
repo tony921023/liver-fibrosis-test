@@ -64,6 +64,9 @@ class _RelabelDataset(Subset):
         original_index = self.indices[i]
         return x, self._mapped[original_index]
 
+    def __getitems__(self, indices):
+        return [self.__getitem__(idx) for idx in indices]
+
 
 def _stratified_three_way(indices, labels, val_frac, test_frac, seed, stratify):
     """先切出 test,再從剩下的切 val,兩者比例皆相對「全體」。"""
