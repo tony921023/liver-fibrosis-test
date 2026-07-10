@@ -18,5 +18,7 @@ kaggle.json
 runs/
 wandb/
 outputs/
+outputs_*/
+results/
 *.log
 .DS_Store

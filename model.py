@@ -43,8 +43,15 @@ def _head_module(model, config):
     return getattr(model, _head_attr(config))
 
 
-def _replace_head(model, head_attr, num_classes):
-    """把 head 裡的最後一層 Linear 換成輸出 num_classes 的新 Linear。
+def _new_head(in_features, num_classes, dropout):
+    """分類頭:dropout > 0 時在 Linear 前加一層 Dropout(對抗過擬合)。"""
+    if dropout <= 0:
+        return nn.Linear(in_features, num_classes)
+    return nn.Sequential(nn.Dropout(dropout), nn.Linear(in_features, num_classes))
+
+
+def _replace_head(model, head_attr, num_classes, dropout):
+    """把 head 裡的最後一層 Linear 換成輸出 num_classes 的新 head。
 
     head 本身就是 Linear(resnet)→ 直接整個換掉;
     head 是 Sequential(efficientnet/convnext)→ 只換裡面最後一層 Linear,
@@ -52,12 +59,12 @@ def _replace_head(model, head_attr, num_classes):
     """
     head = getattr(model, head_attr)
     if isinstance(head, nn.Linear):
-        setattr(model, head_attr, nn.Linear(head.in_features, num_classes))
+        setattr(model, head_attr, _new_head(head.in_features, num_classes, dropout))
         return
 
     for i in range(len(head) - 1, -1, -1):
         if isinstance(head[i], nn.Linear):
-            head[i] = nn.Linear(head[i].in_features, num_classes)
+            head[i] = _new_head(head[i].in_features, num_classes, dropout)
             return
     raise ValueError(f"在 {head_attr} 裡找不到 nn.Linear,無法替換分類頭")
 
@@ -73,7 +80,7 @@ def build_model(num_classes, config):
     # 多模態:把 head 的 in_features 改成 in_features + tabular_dim,並在 forward 前
     #         將影像 feature 與 tabular 向量 concat 後丟進這個 head。
     # attention-MIL:head 之前先做 attention pooling 聚合多視角 feature。
-    _replace_head(model, head_attr, num_classes)  # 新 head 預設 requires_grad=True
+    _replace_head(model, head_attr, num_classes, config.DROPOUT)  # 新 head 預設 requires_grad=True
 
     # 凍結/解凍由 train.py 依兩階段流程控制(見 set_backbone_trainable)
     return model

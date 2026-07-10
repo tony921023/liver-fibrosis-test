@@ -36,13 +36,34 @@ def get_device():
     return "cpu"
 
 
+def _mixup(x, y, alpha):
+    """把 batch 內兩兩樣本按 lam 線性混合,回傳 (mixed_x, y_a, y_b, lam)。
+
+    影像混合、標籤不混合 —— 改成 loss 端用 lam 加權兩個 CE
+    (等價於混合 one-hot 標籤,但這樣寫可以直接沿用帶 class weight / label
+    smoothing 的 CrossEntropyLoss,不必自己攤開 soft target)。
+    """
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
+    # batch 只有 1 張時 mixup 等於沒混(randperm 只會拿到自己),直接跳過
+    use_mixup = config.MIXUP_ALPHA > 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        loss = criterion(model(x), y)
+
+        if use_mixup and x.size(0) > 1:
+            x, y_a, y_b, lam = _mixup(x, y, config.MIXUP_ALPHA)
+            logits = model(x)
+            loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
+        else:
+            loss = criterion(model(x), y)
+
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * x.size(0)
@@ -80,9 +101,12 @@ def collect(model, loader, criterion, device, tta=False):
 def _build_optimizer(model):
     """param_groups 只收 requires_grad 的參數:
     暖身階段 backbone 凍結 → 只剩 head;微調階段含 backbone(differential LR)。
+
+    用 AdamW 而非 Adam:AdamW 的 weight decay 是 decoupled 的,不會被 Adam 的
+    自適應學習率縮放掉,才真的起到正則化作用。WEIGHT_DECAY=0 時兩者等價。
     """
     groups = param_groups(model, config, backbone_lr=config.BACKBONE_LR, head_lr=config.HEAD_LR)
-    return torch.optim.Adam(groups)
+    return torch.optim.AdamW(groups, weight_decay=config.WEIGHT_DECAY)
 
 
 def _build_scheduler(optimizer, finetune_epochs):
@@ -112,6 +136,13 @@ def main():
     # class weights 依 train split 頻率算(見 dataset._class_weights);label smoothing 見 config
     weights = data.class_weights.to(device) if data.class_weights is not None else None
     criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=config.LABEL_SMOOTHING)
+
+    print(f"[train] backbone={config.BACKBONE}  dropout={config.DROPOUT}  "
+          f"weight_decay={config.WEIGHT_DECAY}  mixup_alpha={config.MIXUP_ALPHA}")
+    if config.MIXUP_ALPHA > 0:
+        # mixup 的 target 是混合的,loss 天生比 val 高;兩者不能直接比大小判斷過擬合,
+        # 要看 val_loss 自己的走勢有沒有回升。
+        print("[train] ⚠️ mixup 開啟 → train_loss 會偏高,不可直接與 val_loss 比較")
 
     os.makedirs(config.CKPT_DIR, exist_ok=True)
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
@@ -203,9 +234,12 @@ def main():
         report, os.path.join(config.RESULTS_DIR, "test_report.json"),
         extra={"best_epoch": int(ckpt["epoch"]), "backbone": config.BACKBONE,
                "task": config.TASK, "val_macro_auroc_best": float(best_metric),
-               # 記下影響可信度的設定,之後對照不同 run 才知道數字是哪來的
+               # 記下影響可信度與結果的設定,之後對照不同 run 才知道數字是哪來的
                "dedup": config.DEDUP, "tta": config.TTA,
-               "aug_strength": config.AUG_STRENGTH})
+               "aug_strength": config.AUG_STRENGTH,
+               "weight_decay": config.WEIGHT_DECAY, "dropout": config.DROPOUT,
+               "mixup_alpha": config.MIXUP_ALPHA,
+               "label_smoothing": config.LABEL_SMOOTHING})
     metrics.save_confusion_png(
         report, os.path.join(config.RESULTS_DIR, "confusion_matrix.png"))
     print(f"\n結果已存到 {config.RESULTS_DIR}/:"

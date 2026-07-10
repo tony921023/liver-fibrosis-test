@@ -61,16 +61,27 @@ def full_report(labels, probs, class_names):
         for i in idx
     }
 
-    return {
+    cm = confusion_matrix(labels, preds, labels=idx)
+
+    report = {
         "macro_auroc": macro_auroc(labels, probs, num_classes),
         "balanced_accuracy": float(balanced_accuracy_score(labels, preds)),
         # QWK 主要對 ordinal 多分類有意義;二元時等同一般 kappa,仍可參考
         "quadratic_weighted_kappa": float(
             cohen_kappa_score(labels, preds, labels=idx, weights="quadratic")),
         "per_class": per_class,
-        "confusion_matrix": confusion_matrix(labels, preds, labels=idx).tolist(),
+        "confusion_matrix": cm.tolist(),
         "class_names": list(class_names),
     }
+
+    if num_classes == 2:
+        # 二元任務(如 >=F2)臨床上看的是 sensitivity / specificity,不是 accuracy。
+        # 慣例:class 1 = 陽性。cm = [[TN, FP], [FN, TP]]
+        tn, fp, fn, tp = cm.ravel()
+        report["sensitivity"] = float(tp / (tp + fn)) if (tp + fn) else 0.0
+        report["specificity"] = float(tn / (tn + fp)) if (tn + fp) else 0.0
+
+    return report
 
 
 def format_report(report):
@@ -79,6 +90,9 @@ def format_report(report):
     lines.append(f"macro AUROC        : {report['macro_auroc']:.4f}")
     lines.append(f"balanced accuracy  : {report['balanced_accuracy']:.4f}")
     lines.append(f"quadratic w. kappa : {report['quadratic_weighted_kappa']:.4f}")
+    if "sensitivity" in report:
+        lines.append(f"sensitivity (recall陽性): {report['sensitivity']:.4f}")
+        lines.append(f"specificity            : {report['specificity']:.4f}")
     lines.append("per-class:")
     lines.append(f"  {'class':<8}{'precision':>10}{'recall':>9}{'f1':>8}{'support':>9}")
     for name, m in report["per_class"].items():
