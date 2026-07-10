@@ -19,6 +19,7 @@ runs/
 wandb/
 outputs/
 outputs_*/
-results/
+results*/
+*.zip
 *.log
 .DS_Store
