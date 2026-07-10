@@ -122,14 +122,12 @@ def _build_scheduler(optimizer, finetune_epochs):
     raise ValueError(f"未知的 SCHEDULER: {name!r}")
 
 
-def main():
-    torch.manual_seed(config.SEED)
-    np.random.seed(config.SEED)
+def run_one(data, device, results_dir, ckpt_path):
+    """訓練一次 + 在 test 集評估一次,回傳 report dict。
 
-    device = get_device()
-    print("device:", device, "| torch:", torch.__version__)
-
-    data = get_dataloaders(config)
+    抽出來是為了讓 train.py(單一 split)與 crossval.py(k-fold)共用同一段邏輯,
+    不會出現「CV 跑的其實是另一份訓練流程」這種對不起來的狀況。
+    """
     num_classes, class_names = data.num_classes, data.class_names
     model = build_model(num_classes, config).to(device)
 
@@ -144,9 +142,8 @@ def main():
         # 要看 val_loss 自己的走勢有沒有回升。
         print("[train] ⚠️ mixup 開啟 → train_loss 會偏高,不可直接與 val_loss 比較")
 
-    os.makedirs(config.CKPT_DIR, exist_ok=True)
-    os.makedirs(config.RESULTS_DIR, exist_ok=True)
-    ckpt_path = os.path.join(config.CKPT_DIR, "best.pt")
+    os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
 
     # --- Phase 1:暖身(凍結 backbone,只訓 head)---
     warmup = max(0, min(config.WARMUP_EPOCHS, config.EPOCHS))
@@ -210,10 +207,8 @@ def main():
     print(f"best val_macro_auroc={best_metric:.4f} @ epoch {best_epoch}  -> {ckpt_path}")
 
     # --- 存每輪指標與訓練曲線 ---
-    csv_path = os.path.join(config.RESULTS_DIR, "metrics.csv")
-    curves_path = os.path.join(config.RESULTS_DIR, "curves.png")
-    metrics.save_history_csv(history, csv_path)
-    metrics.save_curves(history, curves_path)
+    metrics.save_history_csv(history, os.path.join(results_dir, "metrics.csv"))
+    metrics.save_curves(history, os.path.join(results_dir, "curves.png"))
 
     # --- 載回最佳權重,在「獨立 test 集」評一次(這才是要回報的數字)---
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -230,20 +225,36 @@ def main():
     else:
         print("🚨 DEDUP=False:重複影像橫跨 train/test,以下數字嚴重灌水,不具參考價值。")
 
+    # 記下影響可信度與結果的設定,之後對照不同 run 才知道數字是哪來的
+    extra = {"best_epoch": int(ckpt["epoch"]), "backbone": config.BACKBONE,
+             "task": config.TASK, "val_macro_auroc_best": float(best_metric),
+             "dedup": config.DEDUP, "tta": config.TTA,
+             "aug_strength": config.AUG_STRENGTH,
+             "weight_decay": config.WEIGHT_DECAY, "dropout": config.DROPOUT,
+             "mixup_alpha": config.MIXUP_ALPHA,
+             "label_smoothing": config.LABEL_SMOOTHING}
+
     metrics.save_report_json(
-        report, os.path.join(config.RESULTS_DIR, "test_report.json"),
-        extra={"best_epoch": int(ckpt["epoch"]), "backbone": config.BACKBONE,
-               "task": config.TASK, "val_macro_auroc_best": float(best_metric),
-               # 記下影響可信度與結果的設定,之後對照不同 run 才知道數字是哪來的
-               "dedup": config.DEDUP, "tta": config.TTA,
-               "aug_strength": config.AUG_STRENGTH,
-               "weight_decay": config.WEIGHT_DECAY, "dropout": config.DROPOUT,
-               "mixup_alpha": config.MIXUP_ALPHA,
-               "label_smoothing": config.LABEL_SMOOTHING})
+        report, os.path.join(results_dir, "test_report.json"), extra=extra)
     metrics.save_confusion_png(
-        report, os.path.join(config.RESULTS_DIR, "confusion_matrix.png"))
-    print(f"\n結果已存到 {config.RESULTS_DIR}/:"
+        report, os.path.join(results_dir, "confusion_matrix.png"))
+    print(f"\n結果已存到 {results_dir}/:"
           " metrics.csv, curves.png, confusion_matrix.png, test_report.json")
+
+    # 回傳的內容與存進 json 的完全一致,crossval.py 才拿得到 best_epoch 等欄位
+    return {**report, **extra}
+
+
+def main():
+    torch.manual_seed(config.SEED)
+    np.random.seed(config.SEED)
+
+    device = get_device()
+    print("device:", device, "| torch:", torch.__version__)
+
+    data = get_dataloaders(config)
+    run_one(data, device, config.RESULTS_DIR,
+            os.path.join(config.CKPT_DIR, "best.pt"))
 
 
 if __name__ == "__main__":

@@ -33,28 +33,58 @@
 ## 目標結構(請重構成這樣)
 - `dataset.py`:資料載入 / transforms / stratified split
 - `model.py`:模型定義(transfer learning,backbone 可換)
-- `train.py`:訓練迴圈 + 評估(macro AUROC)
-- `config.py` 或 argparse:集中超參數與選項
+- `train.py`:訓練迴圈 + 評估(單一 split);`run_one()` 供 crossval 重用
+- `crossval.py`:k-fold cross-validation,輸出 mean ± std 與 out-of-fold confusion matrix
+- `metrics.py`:評估指標與結果輸出(與訓練流程解耦)
+- `config.py`:集中超參數與選項;`DATA_DIR`/`TASK`/`RESULTS_DIR`/`CV_RESULTS_DIR` 可用環境變數覆蓋
 
-## 誠實基準線(2026-07-10,dedup 後首輪)
-resnet18,尚未加正則化。**這是後續改動要比較的對象。**
+## 基準線(2026-07-10,dedup 後,單一 split)
+**這是後續改動要比較的對象。** 全部 resnet18、TTA、SEED=42。
 
-| 指標 | resnet18 | resnet50 |
+### multiclass(5 分期)
+
+| 指標 | 無正則化 | +正則化 |
 |---|---|---|
-| macro AUROC | 0.9398 | 0.9339 |
-| balanced accuracy | **0.7506** | 0.7595 |
-| QWK | 0.8195 | 0.7828 |
+| macro AUROC | 0.9398 | 0.9474 |
+| **balanced accuracy** | **0.7506** | **0.7680** |
+| QWK | 0.8195 | 0.8300 |
+| best_epoch | 13 | 20~30 |
 
-- **balanced accuracy 0.75 才是真正的難度**;macro AUROC 在 5 分類 OvR 下偏寬鬆(F0 太好分)
-- per-class recall:F0=1.000 / F1=0.644 / F2=0.609 / F3=0.739 / F4=0.761
+- **balanced accuracy 才是真正的難度**;macro AUROC 在 5 分類 OvR 下偏寬鬆(F0 太好分)
+- per-class recall(無正則化):F0=1.000 / F1=0.644 / F2=0.609 / F3=0.739 / F4=0.761
   → **F1/F2/F3 中間分期是戰場**,與臨床上判讀者間差異最大的區間一致
-- 錯誤有 ordinal 結構:正確 75.3% / 錯 1 期 14.3% / 錯 ≥2 期 10.4%
-- **過擬合是瓶頸**:train_loss 1.44→0.30,但 val_loss 從 epoch 10 起卡在 0.87,
-  val AUROC plateau 在 0.92。resnet50 不比 resnet18 好 → 限制在資料量,不在模型容量
-  → 已加 `WEIGHT_DECAY` / `DROPOUT` / `MIXUP_ALPHA` 對抗
-- ⚠️ 這些數字**仍偏樂觀**:patient-level leakage 還在(見上方 Leakage 警告)
-- ⚠️ test 只有 231 張、每類約 46 張,單一 split 的 recall 95% CI 約 ±0.13。
-  resnet18 vs resnet50 的差距落在雜訊裡,要下定論得先做 k-fold CV
+- 錯誤有 ordinal 結構:正確 77.1% / 錯 1 期 13.4% / 錯 ≥2 期 9.5%(正則化後)
+- **過擬合曾是瓶頸**:train_loss 1.44→0.30,val_loss 從 epoch 10 起卡在 0.87。
+  加 `WEIGHT_DECAY`/`DROPOUT`/`MIXUP_ALPHA` 後 best_epoch 推遲到 20~30,確認有效
+
+### binary_geF2(≥F2 顯著纖維化)
+
+| | sensitivity | specificity | balanced acc |
+|---|---|---|---|
+| 5 分類結果直接摺成二元 | 0.855 | 0.839 | 0.847 |
+| **專門訓練的二元模型** | **0.957** | 0.804 | **0.881** |
+
+專訓贏過摺疊。高 sens / 低 spec 是 `CLASS_WEIGHTS="auto"`(權重 1.20/0.80)推的,
+臨床上方向正確(漏掉顯著纖維化的代價高)。要別的取捨點調閾值即可,不必重訓。
+
+### backbone:越大越差(皆含正則化)
+
+| backbone | AUROC | bal.acc | QWK |
+|---|---|---|---|
+| **resnet18** | **0.9474** | **0.7680** | **0.8300** |
+| resnet50 | 0.9308 | 0.7333 | 0.8213 |
+| convnext_tiny | 0.9352 | 0.7295 | 0.7293 |
+
+去重後只剩 1074 張訓練影像,**瓶頸是資料量不是模型容量**。別再往上換 backbone。
+
+### ⚠️ 這些數字的三個但書
+1. **仍偏樂觀** —— patient-level leakage 還在(見上方 Leakage 警告)
+2. **單一 split 的雜訊可能吞掉增益** —— test 只有 231 張、每類約 46 張,
+   recall 95% CI 約 ±0.13。同設定跑兩次,QWK 就差 0.0132(同 seed、同 split,
+   差異僅來自 cuDNN/mixup 非決定性 → 這只是雜訊**下限**)。
+   → 用 `crossval.py` 做 k-fold 才能拿到帶誤差棒的結論
+3. **F0 recall 三次都是 1.000(48/48)** —— 完美到需要警覺。可能只是正常肝好認,
+   也可能 F0 影像來自不同機器/前處理,模型在認「來源」而非「病理」。尚未排除
 
 ## 本階段範圍
 1. 先做**能跑的 5 分類 transfer learning baseline**(resnet,先小後大)

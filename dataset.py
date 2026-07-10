@@ -30,7 +30,7 @@ from typing import List, Optional
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 
 @dataclass
@@ -178,8 +178,34 @@ def _stratified_three_way(indices, labels, val_frac, test_frac, seed, stratify):
     return train_idx, val_idx, test_idx
 
 
-def get_dataloaders(config):
+def _kfold_split(indices, labels, fold, n_folds, val_frac, seed):
+    """第 fold 折(0-based)當 test,其餘再切出 val。
+
+    n_folds 折輪流當 test → 每張影像剛好被評估一次,合起來就是整份資料的
+    out-of-fold 估計,比單一 split 穩定得多。
+    val 仍占「全體」的 val_frac(從剩下的 1 - 1/n_folds 裡按比例切)。
+    """
+    label_of = dict(zip(indices, labels))
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    train_val_pos, test_pos = list(skf.split(indices, labels))[fold]
+
+    train_val_idx = [indices[p] for p in train_val_pos]
+    test_idx = [indices[p] for p in test_pos]
+
+    rel_val = val_frac / (1.0 - 1.0 / n_folds)
+    strat_tv = [label_of[i] for i in train_val_idx]
+    train_idx, val_idx = train_test_split(
+        train_val_idx, test_size=rel_val, random_state=seed,
+        shuffle=True, stratify=strat_tv,
+    )
+    return train_idx, val_idx, test_idx
+
+
+def get_dataloaders(config, fold=None):
     """回傳 DataBundle。
+
+    fold=None       → 單一 stratified 三分(train/val/test)
+    fold=0..N-1     → k-fold cross-validation 的第 fold 折當 test(見 _kfold_split)
 
     用兩個共用同一份影像、但 transform 不同的 ImageFolder:
     train 拿 augmentation 版,val/test 拿 eval 版;再以同一組 stratified
@@ -206,11 +232,18 @@ def get_dataloaders(config):
 
     # stratify 要拿「這些 index 對應的 label」,不能整份 mapped_targets 傳進去
     split_labels = [mapped_targets[i] for i in indices]
-    train_idx, val_idx, test_idx = _stratified_three_way(
-        indices, split_labels,
-        val_frac=config.VAL_SPLIT, test_frac=config.TEST_SPLIT,
-        seed=config.SEED, stratify=config.STRATIFY,
-    )
+    if fold is None:
+        train_idx, val_idx, test_idx = _stratified_three_way(
+            indices, split_labels,
+            val_frac=config.VAL_SPLIT, test_frac=config.TEST_SPLIT,
+            seed=config.SEED, stratify=config.STRATIFY,
+        )
+    else:
+        train_idx, val_idx, test_idx = _kfold_split(
+            indices, split_labels, fold=fold, n_folds=config.N_FOLDS,
+            val_frac=config.VAL_SPLIT, seed=config.SEED,
+        )
+        print(f"[dataset] cross-validation: fold {fold + 1}/{config.N_FOLDS}")
 
     train_set = _RelabelDataset(train_base, train_idx, mapped_targets)   # augmentation
     val_set = _RelabelDataset(eval_base, val_idx, mapped_targets)        # eval transform

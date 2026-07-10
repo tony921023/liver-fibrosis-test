@@ -43,6 +43,12 @@ TEST_SPLIT = 0.15
 STRATIFY = True                # 依類別分層,避免小類別在某個 split 缺漏
 SEED = 42                      # 固定亂數種子 → 同一份 split 可重現
 
+# ---- cross-validation(crossval.py 用)----
+# 單一 split 的 test 只有 231 張、每類約 46 張,recall 的 95% CI 約 ±0.13,
+# 小幅改動(例如正則化帶來的 +0.018 balanced accuracy)分不出是真的還是雜訊。
+# k-fold 讓每張影像剛好被評估一次,拿到的是 out-of-fold 估計 + 摺間標準差。
+N_FOLDS = 5
+
 # ---- 訓練(兩階段微調)----
 # Phase 1「暖身」:凍結 backbone,只訓 head,跑 WARMUP_EPOCHS 輪。
 # Phase 2「微調」:解凍 backbone,用 differential LR 微調,跑到 EPOCHS。
@@ -96,6 +102,8 @@ CKPT_DIR = "checkpoints"       # 最佳權重存這(已被 .gitignore 擋掉,不
 # 跑不同設定時用環境變數分開存,才不會互相覆蓋:
 #     RESULTS_DIR=outputs_binary TASK=binary_geF2 python train.py
 RESULTS_DIR = os.environ.get("RESULTS_DIR", "outputs")   # 已被 .gitignore 擋掉
+# crossval.py 的輸出根目錄,底下是 fold_1/ ... fold_N/ 與 cv_summary.json
+CV_RESULTS_DIR = os.environ.get("CV_RESULTS_DIR", "outputs_cv")
 
 # ---- 模型 ----
 # 可選:resnet18 / resnet34 / resnet50 / resnet101 / efficientnet_b0 / convnext_tiny
