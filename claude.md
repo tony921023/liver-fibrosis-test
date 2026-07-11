@@ -16,16 +16,20 @@
 - **device 自動偵測**:cuda → mps → cpu,同一份 code 在 Mac 和 Colab 都能跑
 - **不要**把 data/、venv/、模型權重、kaggle.json commit 進 git
 - requirements.txt 用寬鬆版本(Mac arm64 ↔ Colab x86 相容)
-- **Leakage 警告(兩層,務必分清楚)**:
-  1. **完全重複的影像**(已處理):6323 個檔案只有 1536 張不重複的圖,平均每張被複製約 4 次
-     (最多 18 次)。隨機 split 會讓同一張圖的複製品同時落在 train/test —— 實測 train∩test
-     有 **636 張位元組相同**的影像,模型用背的就滿分(舊 test macro AUROC = 0.9975,
-     F0/F4 recall = 1.000,正是複製倍率最高的兩類)。
-     → `config.DEDUP=True` 依內容 hash 去重後再 split,已消除此層。
-     附註:1536 個 hash 全部只對應單一類別,**沒有跨類別重複**,標籤本身沒有矛盾。
-  2. **patient-level leakage**(無解):檔名是「字母前綴 + 流水號」(`a1000.jpg`/`I2079.jpg`/
-     `z9945.jpg`…),前綴不對應病人,**無病人 ID**,做不到 patient-level split。
-     即使去重,同一病人的不同切面仍可能分散在不同 split。
+- **Leakage 警告(三層,務必分清楚)**:
+  1. **完全重複的影像**(已處理):6323 個檔案只有 1536 張位元組不重複的圖,平均每張被複製約
+     4 次(最多 18 次)。隨機 split 會讓同一張圖的複製品同時落在 train/test —— 實測 train∩test
+     有 **636 張位元組相同**的影像,模型用背的就滿分(舊 test macro AUROC = 0.9975)。
+     → `config.DEDUP="exact"`(或 `True`)依 md5 去重後再 split,已消除此層。
+  2. **近重複的影像**(可選處理):exact 去重後的 1536 張裡,還有約 148 張是「重新壓縮/
+     縮放過」的近重複(dHash 相同、位元組不同)。**F0 特別多:317→199**,這正是 F0 recall
+     一直偏高(0.97~1.00)的可疑來源。
+     → `config.DEDUP="perceptual"` 在 exact 之上再用 dHash 去近重複 → 1388 張
+     (F0/F1/F2/F3/F4 = 199/288/308/308/285)。只在同類別內合併(超音波黑背景+扇形區會
+     讓 F0/F4 偶爾撞 dHash,跨類別合併會誤刪)。
+  3. **patient-level leakage**(無解):檔名是「字母前綴 + 流水號」(`a1000.jpg`/`I2079.jpg`…),
+     前綴不對應病人,**無病人 ID**,做不到 patient-level split。即使去重,同一病人的不同切面
+     仍可能分散在不同 split。
   → 因此**所得 AUROC 仍偏樂觀、不可當真實表現**,程式註解須標明。
   真實 patient-level 評估留給未來臨床資料(屆時把 `dataset._dedup_indices` 換成依病人 ID 的
   `GroupShuffleSplit` 即可)。

@@ -18,14 +18,17 @@ MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
 # ---- 去重(dedup)----
-# ⚠️ 這份公開資料含大量「位元組完全相同」的重複影像:
-#     6323 個檔案其實只有 1536 張不重複的圖(平均每張被複製約 4 次,最多 18 次)。
-# 隨機 split 會讓同一張圖的複製品同時落在 train 與 test → 模型用背的就近乎滿分
-#(去重前 test macro AUROC = 0.9975,F0/F4 recall = 1.000,正是複製倍率最高的兩類)。
-# DEDUP=True 會先依「檔案內容 hash」分組,每組只留一張代表,再做 split。
-# 去重後各類約 300 張(F0~F4 = 317/296/308/308/307),其實相當平衡。
-# 設 False 可重現舊的「灌水」數字,用來對照。
-DEDUP = True
+# ⚠️ 這份公開資料含大量重複影像。隨機 split 會讓同一張圖的複製品同時落在
+#    train 與 test → 模型用背的就近乎滿分(去重前 test macro AUROC = 0.9975)。
+# 模式:
+#   True / "exact"  依「檔案內容 md5」去重,只去位元組完全相同的。
+#                   6323 張 -> 1536 張(平均每張被複製約 4 次,最多 18 次)。
+#   "perceptual"    在 exact 之上再用 dHash 去「重新壓縮/縮放過的近重複」。
+#                   同類別內 1536 張還有約 148 張近重複 -> 約 1388 張。
+#                   這是目前能去掉的最後一層 exact/near leakage。
+#   False           不去重,用來重現舊的「灌水」數字對照。
+# 兩者都消不掉 patient-level leakage(無病人 ID),詳見 dataset.py 的 LEAKAGE 警告。
+DEDUP = os.environ.get("DEDUP", "exact")
 
 # ---- augmentation 強度 ----
 # "basic"  = resize + 水平翻轉(原本的設定)

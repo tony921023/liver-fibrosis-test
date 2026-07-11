@@ -27,6 +27,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import List, Optional
 
+import numpy as np
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
@@ -82,8 +83,8 @@ def _build_transforms(config):
 def _content_hash(path, chunk_size=1 << 20):
     """檔案內容的 md5。用來抓「位元組完全相同」的重複影像。
 
-    注意:只抓得到 exact duplicate。若同一張圖被重新壓縮 / 縮放過(near-duplicate),
-    hash 會不同、抓不到 —— 那需要 perceptual hash,目前先不做。
+    只抓得到 exact duplicate。同一張圖被重新壓縮 / 縮放過(near-duplicate)hash 會不同
+    → 那要用 _perceptual_hash(DEDUP="perceptual")。
     """
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -92,16 +93,49 @@ def _content_hash(path, chunk_size=1 << 20):
     return h.hexdigest()
 
 
-def _dedup_indices(samples):
-    """依內容 hash 分組,每組只保留第一個出現的 index。
+def _perceptual_hash(path):
+    """dHash(difference hash):抓「視覺上幾乎相同」但位元組不同的近重複。
 
-    samples 是 ImageFolder.samples,已按路徑排序 → 「第一個」是決定性的,
-    不受檔案系統列舉順序影響,同一份資料每次跑都得到同一組代表。
+    縮到 9x8 灰階,比較相鄰像素亮度大小 → 64-bit 指紋。對重新壓縮 / 輕微縮放
+    穩定(看的是低頻結構不是像素值)。回傳 bytes 供當 dict key。
+
+    ⚠️ 已知限制:超音波影像都是「黑背景 + 扇形探頭區」,低頻結構相近,
+    偶爾會讓兩張「其實不同組織」的圖(如某些 F0/F4)撞到同一個 dHash。
+    因此 perceptual dedup 只在「同類別內」去重,不跨類別合併,避免把
+    這種哈希碰撞誤刪成跨類別重複。
+    """
+    from PIL import Image  # 延後匯入:只有開 perceptual dedup 才需要
+    img = Image.open(path).convert("L").resize((9, 8), Image.BILINEAR)
+    a = np.asarray(img, dtype=np.int16)
+    bits = (a[:, 1:] > a[:, :-1]).flatten()
+    return np.packbits(bits).tobytes()
+
+
+def _dedup_indices(samples, mode="exact"):
+    """依內容分組,每組只保留第一個出現的 index(決定性,不受列舉順序影響)。
+
+    mode="exact"      md5,只去位元組完全相同的圖
+    mode="perceptual" 先 md5 去 exact,再對代表影像算 dHash 去近重複。
+                      dHash 相同「且同類別」才視為重複(見 _perceptual_hash 的限制)。
+
+    samples 是 ImageFolder.samples,已按路徑排序。
     """
     seen = {}
     for i, (path, _) in enumerate(samples):
         seen.setdefault(_content_hash(path), i)
-    return sorted(seen.values())
+    exact_idx = sorted(seen.values())
+
+    if mode == "exact":
+        return exact_idx
+    if mode != "perceptual":
+        raise ValueError(f"未知的 DEDUP 模式: {mode!r};可選 True/'exact'/'perceptual'/False")
+
+    # 在 exact 代表影像之上再去近重複;key 帶 label,確保只在同類別內合併
+    seen_p = {}
+    for i in exact_idx:
+        path, label = samples[i]
+        seen_p.setdefault((label, _perceptual_hash(path)), i)
+    return sorted(seen_p.values())
 
 
 def _class_weights(labels, num_classes, mode):
@@ -222,10 +256,19 @@ def get_dataloaders(config, fold=None):
     mapped_targets, num_classes, class_names = _map_targets(
         train_base.targets, train_base.classes, config.TASK)
 
-    if config.DEDUP:
-        indices = _dedup_indices(train_base.samples)
-        print(f"[dataset] dedup: {len(train_base)} 個檔案 -> "
-              f"{len(indices)} 張不重複影像(丟掉 {len(train_base) - len(indices)} 張複製品)")
+    # DEDUP 正規化:相容布林 True/False,也接受環境變數傳進來的字串
+    #(env 一律是字串 → "False"/"none" 都是 truthy,不處理會反而關不掉去重)
+    _DEDUP_ALIAS = {True: "exact", "true": "exact", "exact": "exact",
+                    "perceptual": "perceptual",
+                    False: None, "false": None, "none": None, "": None}
+    key = config.DEDUP.lower() if isinstance(config.DEDUP, str) else config.DEDUP
+    if key not in _DEDUP_ALIAS:
+        raise ValueError(f"未知的 DEDUP: {config.DEDUP!r};可選 'exact'/'perceptual'/False")
+    dedup_mode = _DEDUP_ALIAS[key]
+    if dedup_mode:
+        indices = _dedup_indices(train_base.samples, mode=dedup_mode)
+        print(f"[dataset] dedup({dedup_mode}): {len(train_base)} 個檔案 -> "
+              f"{len(indices)} 張不重複影像(丟掉 {len(train_base) - len(indices)} 張)")
     else:
         indices = list(range(len(train_base)))
         print("[dataset] ⚠️ DEDUP=False:重複影像會橫跨 train/test,指標將嚴重灌水")
