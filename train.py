@@ -233,7 +233,9 @@ def run_one(data, device, results_dir, ckpt_path):
              "weight_decay": config.WEIGHT_DECAY, "dropout": config.DROPOUT,
              "mixup_alpha": config.MIXUP_ALPHA,
              "label_smoothing": config.LABEL_SMOOTHING,
-             "mask": config.MASK}   # 遮罩消融;"none" 以外的數字不可與正常 run 直接比較
+             # 遮罩消融;"none" 以外的數字不可與正常 run 直接比較。
+             # frac 一定要記:center 與 periphery 用的是不同尺寸,少了它無法還原實驗設定。
+             "mask": config.MASK, "mask_frac": config.MASK_FRAC}
 
     metrics.save_report_json(
         report, os.path.join(results_dir, "test_report.json"), extra=extra)

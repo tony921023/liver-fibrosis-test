@@ -42,10 +42,18 @@ DEDUP = os.environ.get("DEDUP", "exact")
 #                  → recall 仍高 = 真的在讀組織,混淆排除 ✅
 # 用環境變數切換:  MASK=center python train.py
 MASK = os.environ.get("MASK", "none")
-# 中央方塊的邊長佔全圖比例。0.7 是實測挑的:center-mask 後「非黑組織像素」只剩 5%,
-# 幾乎只留下扇形輪廓/邊界/背景(= 來源特徵)。太小(0.35 只清掉一半)會留下大片組織,
-# 消融就證明不了東西。
-MASK_FRAC = float(os.environ.get("MASK_FRAC", 0.7))
+# 中央方塊的邊長佔全圖比例。
+# ⚠️ 兩種遮罩需要「不同」的尺寸,不能共用一個值(在 200 張隨機影像上實測):
+#
+#   center(塗黑中央,要把組織清乾淨)      periphery(塗黑邊緣,要保住組織)
+#     frac=0.7  組織仍剩 16%  ← 不夠!      frac=0.6  保留 69% 組織
+#     frac=0.9  組織僅剩 1.9% ✅            frac=0.9  保留 98% ← 幾乎沒遮,無意義
+#
+# → center 用 0.9、periphery 用 0.6,各自用環境變數指定:
+#     MASK=center    MASK_FRAC=0.9 python train.py
+#     MASK=periphery MASK_FRAC=0.6 python train.py
+# 預設 0.9(對 center 而言正確;跑 periphery 時務必自己指定 0.6)。
+MASK_FRAC = float(os.environ.get("MASK_FRAC", 0.9))
 
 # ---- augmentation 強度 ----
 # "basic"  = resize + 水平翻轉(原本的設定)
