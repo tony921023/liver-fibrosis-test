@@ -1,29 +1,24 @@
-"""Grad-CAM 混淆稽核:看模型到底在看「肝實質」還是「來源假影」。
+"""Grad-CAM 混淆稽核:看模型在看「肝實質」還是「來源假影」。
 
-跑法:
-  python explain.py                       # 從 DATA_DIR 每類抽樣,存疊圖 + 邊緣佔比統計
-  python explain.py a1000.jpg b3.jpg      # 指定影像
-  CKPT=checkpoints/best.pt EXPLAIN_DIR=outputs_gradcam python explain.py
+    python explain.py                  # 從 DATA_DIR 每類抽樣
+    python explain.py a1000.jpg        # 指定影像
+    CKPT=... EXPLAIN_DIR=... PER_CLASS=6 python explain.py
 
-為什麼需要這個:
-這份資料沒有病人 ID,做不到 patient-level split,所以「測試分數」是被 leakage 灌水的
-樂觀上限,無法用來判斷模型有沒有作弊。而且實測發現 F0 有 85% 來自檔名前綴 'a'、
-'a' 又有 97% 是 F0 —— 模型很可能在認「來源」而非「病理」。
-當你不能相信分數時,唯一能驗證的是「模型在看哪裡」。
+這份資料沒有病人 ID,測試分數是被 leakage 與來源混淆灌水的上限,無法判斷模型有沒有
+作弊(F0 有 198/199 張來自 'a' 前綴)。不能信分數時,唯一能驗證的是「模型在看哪裡」。
+背景見 docs/leakage.md。
 
-稽核指標:邊緣佔比(border ratio)
-  超音波的肝實質在畫面中央;文字標註、探頭刻度、扇形邊緣多半在四周。
-  把 Grad-CAM 熱圖落在「外框 20%」的能量佔比算出來:
-    佔比高 → 模型盯著邊緣/假影,是 source-confound 的證據
-    佔比低 → 模型盯著中央組織,較可信
-  重點看 F0 的邊緣佔比是否明顯高於其他類。
+**邊緣佔比(border ratio)** = Grad-CAM 熱圖落在外框 20% 的能量比例。
+肝實質在畫面中央,文字標註 / 探頭刻度 / 扇形邊緣多半在四周 →
+佔比高代表模型盯著假影。重點看 F0 是否明顯高於其他類。
 
-輸出(config 的 EXPLAIN_DIR):每張影像的 <類別>_<檔名>_cam.png 疊圖,及終端機統計。
+比遮罩消融(config.MASK)弱 —— 只說「看哪裡」,不說「沒有組織能不能活」,但便宜。
 """
 
 import os
 import sys
 import re
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -41,8 +36,8 @@ from train import get_device
 import config
 
 
-# 每個 backbone 做 Grad-CAM 的目標層:最後一個保留空間維度的 conv/feature block。
 def _target_layer(model, backbone):
+    """Grad-CAM 的目標層:最後一個還保有空間維度的 conv/feature block。"""
     if backbone.startswith("resnet"):
         return model.layer4
     if backbone.startswith("efficientnet") or backbone.startswith("convnext"):
@@ -50,30 +45,38 @@ def _target_layer(model, backbone):
     raise ValueError(f"未支援的 backbone Grad-CAM: {backbone!r}")
 
 
-def _load_model(ckpt_path, device):
-    """載 checkpoint 並重建模型。
+def _model_config(backbone, dropout):
+    """給 build_model 用的區域設定。
 
-    checkpoint 沒存 dropout 設定,而 head 結構(有無 dropout)會改變 state_dict 的 key。
-    → 先按目前 config.DROPOUT 建,載不進去就把 dropout 開關反過來重建再試一次,
-      兩種訓練出來的權重都能載。
+    不直接改 config 的全域變數 —— 那會污染整個 process,之後任何讀 config 的地方
+    都會拿到被偷改的值。
+    """
+    return SimpleNamespace(BACKBONE=backbone, DROPOUT=dropout,
+                           PRETRAINED=False)   # 權重從 checkpoint 載,不必下載預訓練的
+
+
+def _load_model(ckpt_path, device):
+    """載 checkpoint 並重建模型,回傳 (model, ckpt)。
+
+    checkpoint 沒存 dropout,而 head 有沒有 dropout 會改變 state_dict 的 key
+    (fc.weight vs fc.1.weight)→ 兩種都試,哪個載得進去就用哪個。
     """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    config.BACKBONE = ckpt["backbone"]          # 用 checkpoint 的 backbone,不管當下 config
-    num_classes = ckpt["num_classes"]
 
     last_err = None
     for dropout in (config.DROPOUT, 0.0 if config.DROPOUT > 0 else 0.3):
-        config.DROPOUT = dropout
-        model = build_model(num_classes, config)
+        model = build_model(ckpt["num_classes"],
+                            _model_config(ckpt["backbone"], dropout))
         try:
             model.load_state_dict(ckpt["model_state"])
-            model.to(device).eval()
-            # Grad-CAM 需要梯度回傳到 activation,確保參數可求導
-            for p in model.parameters():
-                p.requires_grad_(True)
-            return model, ckpt
         except RuntimeError as e:
             last_err = e
+            continue
+        model.to(device).eval()
+        for p in model.parameters():
+            p.requires_grad_(True)      # Grad-CAM 要把梯度回傳到 activation
+        return model, ckpt
+
     raise RuntimeError(f"無法載入 checkpoint(head 結構對不上):{last_err}")
 
 

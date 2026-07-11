@@ -1,148 +1,90 @@
 """集中超參數與選項。
 
-之所以集中放這裡:之後要搬到真實臨床資料 / 換 backbone / 切換預測目標時,
-只改這一個檔案,train.py、dataset.py、model.py 都不用動。
+搬到臨床資料 / 換 backbone / 切換預測目標時只改這裡,其餘模組不用動。
+常用選項可用環境變數覆蓋(Colab 上不必改檔):
+
+    DEDUP=perceptual TASK=binary_geF2 RESULTS_DIR=outputs_binary python train.py
 """
 
 import os
 
 # ---- 資料 ----
-# ImageFolder root,底下是 F0~F4。
-# Colab 上資料路徑不同,用環境變數覆蓋即可,不用改這個檔案:
-#     %env DATA_DIR=/content/dl/Dataset
-#     !python train.py
-DATA_DIR = os.environ.get("DATA_DIR", "data/Dataset")
+DATA_DIR = os.environ.get("DATA_DIR", "data/Dataset")   # ImageFolder root,底下是 F0~F4
 IMG_SIZE = 224
-# ImageNet 統計值(transfer learning 用 pretrained backbone 時必須對齊)
-MEAN = [0.485, 0.456, 0.406]
+MEAN = [0.485, 0.456, 0.406]    # ImageNet 統計值:用 pretrained backbone 時必須對齊
 STD = [0.229, 0.224, 0.225]
 
-# ---- 去重(dedup)----
-# ⚠️ 這份公開資料含大量重複影像。隨機 split 會讓同一張圖的複製品同時落在
-#    train 與 test → 模型用背的就近乎滿分(去重前 test macro AUROC = 0.9975)。
-# 模式:
-#   True / "exact"  依「檔案內容 md5」去重,只去位元組完全相同的。
-#                   6323 張 -> 1536 張(平均每張被複製約 4 次,最多 18 次)。
-#   "perceptual"    在 exact 之上再用 dHash 去「重新壓縮/縮放過的近重複」。
-#                   同類別內 1536 張還有約 148 張近重複 -> 約 1388 張。
-#                   這是目前能去掉的最後一層 exact/near leakage。
-#   False           不去重,用來重現舊的「灌水」數字對照。
-# 兩者都消不掉 patient-level leakage(無病人 ID),詳見 dataset.py 的 LEAKAGE 警告。
+# ---- 去重 ----
+# "exact"(=True)  依 md5 去位元組完全相同的重複    6323 -> 1536 張
+# "perceptual"    再用 dHash 去近重複(重新壓縮過)  6323 -> 1388 張
+# False           不去重,用來重現去重前的灌水數字
+# ⚠️ 不去重的話 train/test 會有 636 張相同影像,AUROC 灌到 0.9975。見 docs/leakage.md
 DEDUP = os.environ.get("DEDUP", "exact")
 
-# ---- 遮罩消融(confound ablation)----
-# ⚠️ 這份資料的來源與類別高度綁定:perceptual 去重後 F0 有 198/199 張都是 'a' 前綴,
-#    而 'ct' 前綴只出現在 F1~F3。模型可能只是在「認來源」而非「判讀纖維化」——
-#    這件事無法從測試分數看出來(分數本身就被混淆灌水)。
-# 遮罩後重訓,可直接證明模型靠什麼吃飯:
-#   None / "none"  不遮罩(正常訓練)
-#   "center"       塗黑中央肝實質,只留邊緣/背景
-#                  → recall 仍高 = 靠來源假影,混淆確認 🚨
-#   "periphery"    塗黑邊緣,只留中央組織
-#                  → recall 仍高 = 真的在讀組織,混淆排除 ✅
-# 用環境變數切換:  MASK=center python train.py
+# ---- 遮罩消融 ----
+# 來源與類別高度綁定(F0 有 198/199 張是 'a' 前綴),模型可能在「認來源」而非判讀纖維化。
+# 塗黑一部分後重訓,可直接測出模型靠什麼吃飯。見 docs/leakage.md 的「來源混淆」。
+# "none" / "center"(塗黑中央組織) / "periphery"(塗黑邊緣)
 MASK = os.environ.get("MASK", "none")
-# 中央方塊的邊長佔全圖比例。
-# ⚠️ 兩種遮罩需要「不同」的尺寸,不能共用一個值(在 200 張隨機影像上實測):
-#
-#   center(塗黑中央,要把組織清乾淨)      periphery(塗黑邊緣,要保住組織)
-#     frac=0.7  組織仍剩 16%  ← 不夠!      frac=0.6  保留 69% 組織
-#     frac=0.9  組織僅剩 1.9% ✅            frac=0.9  保留 98% ← 幾乎沒遮,無意義
-#
-# → center 用 0.9、periphery 用 0.6,各自用環境變數指定:
-#     MASK=center    MASK_FRAC=0.9 python train.py
-#     MASK=periphery MASK_FRAC=0.6 python train.py
-# 預設 0.9(對 center 而言正確;跑 periphery 時務必自己指定 0.6)。
+# ⚠️ 兩種遮罩要用不同尺寸:center 用 0.9(組織剩 1.9%)、periphery 用 0.6(保留 69% 組織)。
+# 共用一個值會讓其中一邊的對照失去意義。
 MASK_FRAC = float(os.environ.get("MASK_FRAC", 0.9))
 
-# ---- augmentation 強度 ----
-# "basic"  = resize + 水平翻轉(原本的設定)
-# "strong" = 再加 RandomResizedCrop / 小角度旋轉 / 亮度對比抖動
-# 超音波是灰階且方向有意義,所以不做垂直翻轉、不動色相(hue)。
-# 去重後訓練集只剩約 1075 張,augmentation 是主要的過擬合防線。
+# ---- augmentation ----
+# "basic" = resize + 水平翻轉;"strong" = 再加 RandomResizedCrop / 旋轉 / 亮度對比抖動。
+# 超音波是灰階且方向有意義 → 不做垂直翻轉、不動色相。
 AUG_STRENGTH = "strong"
 
-# ---- split (train / val / test 三分)----
-# val 只用來選模型(early stopping / 存 checkpoint),test 只在最後評一次。
-# 這樣回報的數字才不會有「拿同一份 val 既調參又打分」的選模型樂觀偏差。
-# 兩者皆為「占全體」的比例;train = 1 - VAL_SPLIT - TEST_SPLIT。
-VAL_SPLIT = 0.15
+# ---- split ----
+# val 只用來選模型(early stopping / checkpoint),test 只在最後評一次
+# → 回報的數字才沒有「拿同一份 val 既調參又打分」的樂觀偏差。
+VAL_SPLIT = 0.15               # 占全體的比例;train = 1 - VAL_SPLIT - TEST_SPLIT
 TEST_SPLIT = 0.15
-STRATIFY = True                # 依類別分層,避免小類別在某個 split 缺漏
-SEED = 42                      # 固定亂數種子 → 同一份 split 可重現
-
-# ---- cross-validation(crossval.py 用)----
-# 單一 split 的 test 只有 231 張、每類約 46 張,recall 的 95% CI 約 ±0.13,
-# 小幅改動(例如正則化帶來的 +0.018 balanced accuracy)分不出是真的還是雜訊。
-# k-fold 讓每張影像剛好被評估一次,拿到的是 out-of-fold 估計 + 摺間標準差。
-N_FOLDS = 5
+STRATIFY = True
+SEED = 42
+N_FOLDS = 5                    # crossval.py:單一 split 的雜訊太大,結論要靠 CV
 
 # ---- 訓練(兩階段微調)----
-# Phase 1「暖身」:凍結 backbone,只訓 head,跑 WARMUP_EPOCHS 輪。
-# Phase 2「微調」:解凍 backbone,用 differential LR 微調,跑到 EPOCHS。
-# 想退回「單階段只訓 head」→ 設 WARMUP_EPOCHS = EPOCHS;
-# 想「從頭就全網路微調」→ 設 WARMUP_EPOCHS = 0。
-# 去重後資料量掉到約 1/4,每輪步數變少 → 總輪數要拉高才收斂得完。
-EPOCHS = 30                    # 總輪數(含暖身);配合 early stopping,不一定跑滿
-WARMUP_EPOCHS = 3              # 暖身輪數(凍結 backbone)
-HEAD_LR = 1e-3                 # head 的學習率(兩階段都用這個)
-BACKBONE_LR = 1e-4             # 解凍後 backbone 的學習率(較小,避免破壞 pretrained 特徵)
+# Phase 1 凍結 backbone 只訓 head(WARMUP_EPOCHS 輪),Phase 2 解凍 + differential LR。
+# WARMUP_EPOCHS = EPOCHS → 只訓 head;= 0 → 從頭全網路微調。
+EPOCHS = 30
+WARMUP_EPOCHS = 3
+HEAD_LR = 1e-3
+BACKBONE_LR = 1e-4             # 較小,避免破壞 pretrained 特徵
 BATCH_SIZE = 32
 NUM_WORKERS = 2                # Mac/Colab 都安全;Colab 可調大
 
-# ---- 正則化(對抗過擬合)----
-# 首輪 baseline(resnet18,dedup 後 1074 張 train)量到:
-#   train_loss 1.44 → 0.30,但 val_loss 從 epoch 10 起就卡在 0.87 上不去,
-#   val AUROC 也 plateau 在 0.92 —— 之後每一輪都只是在背 training set。
-# 而且 resnet50 表現不比 resnet18 好(AUROC 0.934 vs 0.940),
-# 代表限制在「資料量」不在「模型容量」→ 該加的是正則化,不是更大的 backbone。
-WEIGHT_DECAY = 1e-4            # 用 AdamW(decoupled weight decay);0 = 關閉
-DROPOUT = 0.3                  # 分類頭前的 dropout;0 = 關閉
-# mixup:把兩張影像與其標籤按 lam 線性混合,強迫模型在樣本之間平滑決策邊界。
-# 對小資料集特別有效。alpha 越大混得越兇;0 = 關閉。
-MIXUP_ALPHA = 0.2
+# ---- 正則化 ----
+# 資料量(約 1100 張 train)才是瓶頸,不是模型容量 → 加正則化而非換更大的 backbone。
+WEIGHT_DECAY = 1e-4            # 用 AdamW:decoupled decay 才真的起正則化作用
+DROPOUT = 0.3                  # 分類頭前
+MIXUP_ALPHA = 0.2              # 兩張影像按 lam 線性混合;對小資料集特別有效
 
 # ---- 損失函數 ----
-# label smoothing:避免模型對 5 分期過度自信。分期邊界(F1/F2)本來就有判讀者間差異,
-# 硬標籤把它當成 100% 確定並不合理。0 = 關閉。
+# 分期邊界本來就有判讀者間差異,硬標籤當成 100% 確定並不合理。
 LABEL_SMOOTHING = 0.05
-# "auto" = 依 train split 的類別頻率給權重(少數類權重高);"none" = 不加權。
-# 這份資料去重後已相當平衡,auto 幾乎等於不加權;留著是為了未來臨床資料(通常很不平衡)。
-CLASS_WEIGHTS = "auto"
+CLASS_WEIGHTS = "auto"         # "auto" 依 train 頻率加權 / "none" 不加權
 
-# ---- test-time augmentation ----
-# True = test/val 評估時平均「原圖」與「水平翻轉」兩次的機率,通常小幅穩定提升。
-TTA = True
+TTA = True                     # test 時平均「原圖 + 水平翻轉」兩次的機率
 
-# ---- 學習率排程 ----
-# "cosine"  = CosineAnnealingLR(在 Phase 2 期間退火)
-# "plateau" = ReduceLROnPlateau(val 指標停滯時降 LR)
-# "none"    = 不排程
-SCHEDULER = "cosine"
+SCHEDULER = "cosine"           # "cosine" / "plateau" / "none"
 
 # ---- early stopping / checkpoint ----
-EARLY_STOP_PATIENCE = 7        # 連續幾輪 val 指標沒進步就停;<=0 關閉
-MONITOR = "val_macro_auroc"    # 監看指標(越大越好),也用來決定存哪個 checkpoint
-CKPT_DIR = "checkpoints"       # 最佳權重存這(已被 .gitignore 擋掉,不會誤 commit)
+EARLY_STOP_PATIENCE = 7        # <=0 關閉
+MONITOR = "val_macro_auroc"    # 越大越好;也用來決定存哪個 checkpoint
+CKPT_DIR = "checkpoints"
 
-# ---- 結果輸出 ----
-# 每輪指標(metrics.csv)、訓練曲線、test 集評估報告與 confusion matrix 都存這。
-# 跑不同設定時用環境變數分開存,才不會互相覆蓋:
-#     RESULTS_DIR=outputs_binary TASK=binary_geF2 python train.py
-RESULTS_DIR = os.environ.get("RESULTS_DIR", "outputs")   # 已被 .gitignore 擋掉
-# crossval.py 的輸出根目錄,底下是 fold_1/ ... fold_N/ 與 cv_summary.json
+# ---- 輸出 ----
+# 跑不同設定時用環境變數分開存,才不會互相覆蓋。
+RESULTS_DIR = os.environ.get("RESULTS_DIR", "outputs")
 CV_RESULTS_DIR = os.environ.get("CV_RESULTS_DIR", "outputs_cv")
 
 # ---- 模型 ----
-# 可選:resnet18 / resnet34 / resnet50 / resnet101 / efficientnet_b0 / convnext_tiny
-# 實測 resnet50 沒有比 resnet18 好(macro AUROC 0.934 vs 0.940,QWK 0.783 vs 0.820),
-# 資料量才是瓶頸 → 別急著換更大的 backbone,先把正則化做好。
+# resnet18/34/50/101 / efficientnet_b0 / convnext_tiny
+# ⚠️ 實測 backbone 越大越差(見 docs/results.md)—— 別急著往上換。
 BACKBONE = "resnet18"
 PRETRAINED = True
 
 # ---- 預測目標 ----
-# "multiclass"  = METAVIR 五分期 (F0~F4)
-# "binary_geF2" = 二元門檻 (>=F2 為陽性),臨床上真正在問的「有沒有顯著纖維化」
-# 兩者共用同一份 code,train/dataset/metrics 會自動跟著走。
-# 用環境變數切換:  TASK=binary_geF2 python train.py
+# "multiclass" = METAVIR 五分期;"binary_geF2" = 臨床上真正在問的「有沒有顯著纖維化」
 TASK = os.environ.get("TASK", "multiclass")

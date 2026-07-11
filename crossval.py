@@ -1,31 +1,23 @@
 """k-fold cross-validation:把單一 split 的結論換成帶誤差棒的結論。
 
-跑法:  python crossval.py
-       TASK=binary_geF2 CV_RESULTS_DIR=cv_binary python crossval.py
+    python crossval.py
+    DEDUP=perceptual TASK=binary_geF2 CV_RESULTS_DIR=outputs_cv_binary python crossval.py
 
-**可續跑**:每折跑完就把 report 與預測存進 fold_k/。再次執行時,
-已完成且「設定完全相同」的折會直接載回、不重訓 —— Colab 斷線後重跑
-只會補跑未完成的折。設定(task/backbone/dedup/mask/正則化…)只要有一項不同,
-該折就會重訓,不會把不同設定的結果混進同一份彙總。
+單一 split 的 test 只有 231 張、每類約 46 張,recall 的 95% CI 約 ±0.13 —— 小幅改動
+分不出是真的還是雜訊(見 docs/results.md)。k-fold 讓每張影像剛好當一次 test。
 
-為什麼需要這個:
-單一 split 的 test 只有 231 張、每類約 46 張,recall 的 95% CI 約 ±0.13。
-正則化帶來的 +0.018 balanced accuracy、resnet18 vs resnet50 的 +0.017,
-都可能只是那一份 split 的運氣。k-fold 讓每張影像剛好當一次 test,
-回報 mean ± std(摺間標準差),才能判斷差異是不是真的。
+**可續跑**:每折跑完就存檔,再次執行時已完成的折直接載回、不重訓
+(Colab 斷線重跑只補跑未完成的)。設定只要有一項不同,該折就會重訓 —— 見 _RESUME_KEYS。
 
-輸出(config.CV_RESULTS_DIR):
-  fold_1/ ... fold_N/   每折的 metrics.csv / curves.png / confusion_matrix.png / test_report.json
-  cv_summary.json       彙總:每折的指標、mean ± std、彙總後的 confusion matrix
-  oof_predictions.npz   全體影像的 out-of-fold 預測機率 + 真實標籤(供 calibrate.py 用)
+輸出到 config.CV_RESULTS_DIR:
+  fold_k/               每折的 metrics.csv / curves.png / confusion_matrix.png / test_report.json
+  cv_summary.json       mean ± std、每折指標、彙總的 out-of-fold confusion matrix
+  oof_predictions.npz   全體影像的 out-of-fold 機率 + 標籤(calibrate.py 要用)
 
-out-of-fold 機率為什麼重要:
-每張影像剛好被「沒看過它的那一折模型」預測一次,所以這份機率是全體資料上
-最誠實的預測。校準曲線(reliability diagram)與 ROC/閾值分析都必須建立在
-這份機率上,不能用單一 split 的 test(樣本太少,且與選模型的資料重疊)。
+每張影像剛好被「沒看過它的那一折」預測一次 → oof 機率是全體資料上最誠實的一份。
+校準與 ROC/閾值分析都必須用它,不能用單一 split 的 test(樣本太少,且與選模型的資料重疊)。
 
-⚠️ 這裡的 std 是「摺間變異」,反映 split 的不確定性。
-   它仍消不掉 patient-level leakage(見 dataset.py 的 LEAKAGE 警告)。
+⚠️ std 是摺間變異,反映 split 的不確定性;消不掉 patient-level leakage。
 """
 
 import json

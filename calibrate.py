@@ -1,43 +1,21 @@
-"""校準與 operating point 分析:回答「這個機率能不能信」「閾值該設多少」。
+"""校準與 operating point:回答「這個機率能不能信」「閾值該設多少」。不需重訓。
 
-跑法:
-  python calibrate.py outputs_cv_perceptual_multiclass/oof_predictions.npz
-  python calibrate.py outputs_cv_perceptual_binary_geF2/oof_predictions.npz
+    python calibrate.py outputs_cv_perceptual_multiclass/oof_predictions.npz
 
-吃的是 crossval.py 存的 out-of-fold 機率:每張影像都由「沒看過它的那一折」預測,
-是全體資料上最誠實的一份機率。**不要**用單一 split 的 test 做校準
-(樣本太少,且與選模型的資料重疊)。
+吃 crossval.py 存的 out-of-fold 機率(每張影像由沒看過它的那一折預測)。
+**不要**用單一 split 的 test 做校準 —— 樣本太少,且與選模型的資料重疊。
 
---- 為什麼要看校準 ---
-臨床模型光準確率不夠:模型說「80% 是 F4」時,實際上就該有 80% 真的是 F4。
-準確率高但校準爛的模型,醫師沒辦法拿它的信心值做決策。
-本專案有兩個理由懷疑校準不好:
-  1. mixup + label smoothing 通常讓模型「低估」信心
-  2. 但實測 Grad-CAM 時看到 confidence 幾乎都是 1.00 → 反而像「過度自信」
-  兩股力量方向相反,不量就不知道。
+**校準**:臨床上光準確率不夠,模型說「80% 是 F4」時實際就該有 80% 真的是 F4,
+否則醫師無法拿它的信心值做決策。ECE = 依信心分箱,加權平均 |平均信心 − 實際準確率|。
 
-ECE(Expected Calibration Error):把預測依信心分箱,算每箱「平均信心」與
-「實際準確率」的差,再依箱內樣本數加權平均。0 = 完美校準。
+**溫度縮放**:診斷完要能修。softmax(logit / T),T>1 拉平機率修正過度自信。
+argmax 不變 → 準確率完全不受影響,只讓機率變可信。
 
---- 為什麼要看 operating point ---
-二元 >=F2 現在死用閾值 0.5。臨床真正的問題是:
-「我要 sensitivity 達到 0.90,閾值該設多少?代價是 specificity 掉到多少?」
-→ 不用重訓,調閾值即可。輸出閾值表讓你挑取捨點。
+**bootstrap CI**:摺間 std 只有 5 個點、本身雜訊大。改對全體 out-of-fold 預測重抽 2000 次,
+得到反映樣本量的信賴區間 —— 論文該報的誤差棒。
 
---- 溫度縮放 ---
-診斷完還要能修:溫度縮放只調一個純量 T,softmax(logit / T)。
-T > 1 拉平機率(修過度自信),T < 1 拉尖。**argmax 不變 → 準確率完全不受影響**,
-只讓機率變得可信。臨床上最常用的後處理校準法。
-
---- bootstrap 95% CI ---
-crossval 的「摺間 std」只有 5 個點,本身雜訊很大。改對 1388 張 out-of-fold 預測
-重抽樣 2000 次,得到反映「樣本量」的信賴區間 —— 這才是論文裡該報的誤差棒。
-
-輸出(與 npz 同目錄):
-  reliability.png              校準曲線(對角線 = 完美校準)
-  reliability_temp_scaled.png  溫度縮放後的校準曲線
-  roc.png                      ROC 曲線(僅二元)
-  終端機:ECE、最佳溫度 T、bootstrap 95% CI、閾值表(僅二元)
+輸出(與 npz 同目錄):reliability.png、reliability_temp_scaled.png、roc.png(僅二元)。
+終端機另印 ECE、最佳 T、95% CI、閾值表。
 """
 
 import os

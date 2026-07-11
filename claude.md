@@ -6,110 +6,63 @@
 
 ## 現況
 - 資料:`data/Dataset/F0` ~ `F4`(METAVIR 五分期,ImageFolder 格式)
-  - 檔案 6323 個(5397 `.jpg` + 926 `.png`),但**只有 1536 張不重複影像**(見下方 Leakage)
-  - 去重後各類約 300 張:F0=317, F1=296, F2=308, F3=308, F4=307 → 其實相當平衡
-- 環境:venv,已裝 torch 2.8(arm64/MPS)、torchvision、scikit-learn、pandas、matplotlib、kaggle
-- 開發機:MacBook Pro M2(MPS GPU);訓練也會在 Colab(CUDA)跑 → 程式須同時支援
-- 已有 git repo + GitHub remote;`.gitignore` 已擋掉 data/、venv/、憑證
+  - 6323 個檔案,但去重後只有 **1536 張**(exact)/ **1388 張**(perceptual)
+  - 各類相當平衡(perceptual 後:199/288/308/308/285)
+- 環境:venv,torch 2.8(arm64/MPS)+ torchvision + scikit-learn + matplotlib
+- 開發機 MacBook Pro M2(MPS);訓練在 Colab(CUDA)→ 程式須同時支援
+- git repo + GitHub remote;`.gitignore` 已擋掉 data/、venv/、憑證、輸出
+
+## 🚨 資料問題(動手前務必先讀 [docs/leakage.md](docs/leakage.md))
+1. **完全重複的影像** — 6323 檔只有 1536 張不重複。不去重 AUROC 會灌到 0.9975
+2. **近重複的影像** — exact 之上還有 148 張(F0 特別多)
+3. **來源混淆** — F0 有 198/199 張是 `a` 前綴,`ct` 只在 F1~F3 → 模型可能在「認來源」
+4. **patient-level leakage** — 無病人 ID,**無解**
+
+→ **所有數字都是樂觀上限,不是真實表現。**
 
 ## 重要約束(務必遵守)
 - **device 自動偵測**:cuda → mps → cpu,同一份 code 在 Mac 和 Colab 都能跑
 - **不要**把 data/、venv/、模型權重、kaggle.json commit 進 git
 - requirements.txt 用寬鬆版本(Mac arm64 ↔ Colab x86 相容)
-- **Leakage 警告(三層,務必分清楚)**:
-  1. **完全重複的影像**(已處理):6323 個檔案只有 1536 張位元組不重複的圖,平均每張被複製約
-     4 次(最多 18 次)。隨機 split 會讓同一張圖的複製品同時落在 train/test —— 實測 train∩test
-     有 **636 張位元組相同**的影像,模型用背的就滿分(舊 test macro AUROC = 0.9975)。
-     → `config.DEDUP="exact"`(或 `True`)依 md5 去重後再 split,已消除此層。
-  2. **近重複的影像**(可選處理):exact 去重後的 1536 張裡,還有約 148 張是「重新壓縮/
-     縮放過」的近重複(dHash 相同、位元組不同)。**F0 特別多:317→199**,這正是 F0 recall
-     一直偏高(0.97~1.00)的可疑來源。
-     → `config.DEDUP="perceptual"` 在 exact 之上再用 dHash 去近重複 → 1388 張
-     (F0/F1/F2/F3/F4 = 199/288/308/308/285)。只在同類別內合併(超音波黑背景+扇形區會
-     讓 F0/F4 偶爾撞 dHash,跨類別合併會誤刪)。
-  3. **patient-level leakage**(無解):檔名是「字母前綴 + 流水號」(`a1000.jpg`/`I2079.jpg`…),
-     前綴不對應病人,**無病人 ID**,做不到 patient-level split。即使去重,同一病人的不同切面
-     仍可能分散在不同 split。
-  → 因此**所得 AUROC 仍偏樂觀、不可當真實表現**,程式註解須標明。
-  真實 patient-level 評估留給未來臨床資料(屆時把 `dataset._dedup_indices` 換成依病人 ID 的
-  `GroupShuffleSplit` 即可)。
+- 新增實驗設定時,**記得加進 `train._run_metadata()`** —— 否則之後分不出結果是哪來的
 
-- 🚨 **來源混淆(source confounding)—— 比 leakage 更嚴重的問題**:
-  perceptual 去重後,**檔名前綴(= 資料來源)與類別幾乎完全綁定**:
+## 結構
+| 檔案 | 職責 |
+|---|---|
+| `config.py` | 超參數與選項;常用的可用環境變數覆蓋 |
+| `dataset.py` | 載入 / transforms / dedup / split(單一 split 與 k-fold) |
+| `model.py` | backbone + head;凍結/解凍、differential LR |
+| `metrics.py` | 指標與結果輸出,與訓練流程解耦 |
+| `train.py` | 訓練 + 評估。`run_one()` 是唯一入口,crossval 也用它 |
+| `crossval.py` | k-fold,輸出 mean ± std 與 out-of-fold 機率。**可續跑** |
+| `calibrate.py` | 校準 / 溫度縮放 / bootstrap CI / 閾值表(不用重訓) |
+| `explain.py` | Grad-CAM 混淆稽核 |
+| `colab_setup.ipynb` | Colab 執行流程 |
 
-  | 類別 | n | 主要前綴 |
-  |---|---|---|
-  | **F0** | 199 | **`a` 佔 198 張(99.5%)** |
-  | F1 | 288 | `ct` 45 + 雜 |
-  | F2 | 308 | `ct` 128 + 雜 |
-  | F3 | 308 | `ct` 118 + 雜 |
-  | F4 | 285 | `G`/`F`/`J`/`I` 雜(無 `ct`、無 `a`) |
+## 跑法
+```bash
+python train.py                                        # 單一 split
+DEDUP=perceptual TASK=binary_geF2 python train.py      # 換設定
+python crossval.py                                     # k-fold(結論要靠這個)
+MASK=center MASK_FRAC=0.9 python train.py              # 遮罩消融
+python calibrate.py outputs_cv/oof_predictions.npz     # 校準
+```
 
-  **F0 ≡ `a` 來源**;`ct` 前綴(926 個 `.png`)只出現在 F1~F3。這份資料是**多來源合併**的,
-  模型只要學會「認來源」(機器型號、前處理、扇形幾何、增益)就能拿到大部分分數。
-  **這無法從測試分數看出來**(分數本身就被混淆灌水),也**無法用子群比較檢驗**
-  (非 `a` 的 F0 只剩 1 張,沒有對照組)。
-  → 用 `config.MASK`(遮罩消融)直接測:塗黑中央組織後若表現仍高 = 靠來源假影。
-    另有 `explain.py` 的 Grad-CAM 稽核作為輔證。
+## 結果
+見 [docs/results.md](docs/results.md)。摘要(perceptual + 5-fold CV):
 
-## 目標結構(請重構成這樣)
-- `dataset.py`:資料載入 / transforms / stratified split
-- `model.py`:模型定義(transfer learning,backbone 可換)
-- `train.py`:訓練迴圈 + 評估(單一 split);`run_one()` 供 crossval 重用
-- `crossval.py`:k-fold cross-validation,輸出 mean ± std 與 out-of-fold confusion matrix
-- `metrics.py`:評估指標與結果輸出(與訓練流程解耦)
-- `config.py`:集中超參數與選項;`DATA_DIR`/`TASK`/`RESULTS_DIR`/`CV_RESULTS_DIR` 可用環境變數覆蓋
-
-## 基準線(2026-07-10,dedup 後,單一 split)
-**這是後續改動要比較的對象。** 全部 resnet18、TTA、SEED=42。
-
-### multiclass(5 分期)
-
-| 指標 | 無正則化 | +正則化 |
+| | multiclass | binary ≥F2 |
 |---|---|---|
-| macro AUROC | 0.9398 | 0.9474 |
-| **balanced accuracy** | **0.7506** | **0.7680** |
-| QWK | 0.8195 | 0.8300 |
-| best_epoch | 13 | 20~30 |
+| macro AUROC | 0.936 ± 0.010 | 0.931 ± 0.010 |
+| balanced accuracy | **0.762 ± 0.023** | 0.859 ± 0.021 |
+| sensitivity / specificity | — | 0.862 / 0.856 |
 
-- **balanced accuracy 才是真正的難度**;macro AUROC 在 5 分類 OvR 下偏寬鬆(F0 太好分)
-- per-class recall(無正則化):F0=1.000 / F1=0.644 / F2=0.609 / F3=0.739 / F4=0.761
-  → **F1/F2/F3 中間分期是戰場**,與臨床上判讀者間差異最大的區間一致
-- 錯誤有 ordinal 結構:正確 77.1% / 錯 1 期 13.4% / 錯 ≥2 期 9.5%(正則化後)
-- **過擬合曾是瓶頸**:train_loss 1.44→0.30,val_loss 從 epoch 10 起卡在 0.87。
-  加 `WEIGHT_DECAY`/`DROPOUT`/`MIXUP_ALPHA` 後 best_epoch 推遲到 20~30,確認有效
-
-### binary_geF2(≥F2 顯著纖維化)
-
-| | sensitivity | specificity | balanced acc |
-|---|---|---|---|
-| 5 分類結果直接摺成二元 | 0.855 | 0.839 | 0.847 |
-| **專門訓練的二元模型** | **0.957** | 0.804 | **0.881** |
-
-專訓贏過摺疊。高 sens / 低 spec 是 `CLASS_WEIGHTS="auto"`(權重 1.20/0.80)推的,
-臨床上方向正確(漏掉顯著纖維化的代價高)。要別的取捨點調閾值即可,不必重訓。
-
-### backbone:越大越差(皆含正則化)
-
-| backbone | AUROC | bal.acc | QWK |
-|---|---|---|---|
-| **resnet18** | **0.9474** | **0.7680** | **0.8300** |
-| resnet50 | 0.9308 | 0.7333 | 0.8213 |
-| convnext_tiny | 0.9352 | 0.7295 | 0.7293 |
-
-去重後只剩 1074 張訓練影像,**瓶頸是資料量不是模型容量**。別再往上換 backbone。
-
-### ⚠️ 這些數字的三個但書
-1. **仍偏樂觀** —— patient-level leakage 還在(見上方 Leakage 警告)
-2. **單一 split 的雜訊可能吞掉增益** —— test 只有 231 張、每類約 46 張,
-   recall 95% CI 約 ±0.13。同設定跑兩次,QWK 就差 0.0132(同 seed、同 split,
-   差異僅來自 cuDNN/mixup 非決定性 → 這只是雜訊**下限**)。
-   → 用 `crossval.py` 做 k-fold 才能拿到帶誤差棒的結論
-3. **F0 recall 三次都是 1.000(48/48)** —— 完美到需要警覺。可能只是正常肝好認,
-   也可能 F0 影像來自不同機器/前處理,模型在認「來源」而非「病理」。尚未排除
+⚠️ **所有「A 比 B 好 0.0x」的比較都淹在雜訊裡**(正則化、backbone、專訓 vs 摺疊)。
+單一 split 比不出小差異,結論一律用 `crossval.py`。
 
 ## 本階段範圍
-1. 先做**能跑的 5 分類 transfer learning baseline**(resnet,先小後大)
-2. 指標:macro AUROC(one-vs-rest)+ train/val loss
-3. 結構要預留擴充:**多模態(影像 + tabular)融合**、**attention-MIL(多視角)**
-4. 預測目標目前用 5 分類,但設計成可切換(config 旗標),之後可能改二元門檻(如 ≥F2)
+1. ✅ 5 分類 transfer learning baseline
+2. ✅ leakage 處理、k-fold、校準、混淆稽核
+3. ⏳ 遮罩消融待重跑(frac 修正後)
+4. 預留擴充:**多模態(影像 + tabular)**、**attention-MIL(多視角)**
+   —— 兩者都需要臨床資料才做得動(這份公開資料無 tabular、無病人 ID)

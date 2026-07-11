@@ -1,13 +1,11 @@
-"""評估指標與結果輸出。
+"""評估指標與結果輸出。與訓練流程解耦,搬到臨床資料時可直接重用。
 
-對外:
-  - macro_auroc(labels, probs, num_classes) -> float
-  - full_report(labels, probs, class_names) -> dict   # test 集完整評估
-  - save_history_csv / save_curves / save_confusion_png / save_report_json
+  macro_auroc(labels, probs, num_classes) -> float
+  full_report(labels, probs, class_names) -> dict
+  save_history_csv / save_curves / save_confusion_png / save_report_json
 
-設計成與訓練流程解耦,之後搬到臨床資料、或換成 patient-level 評估時可直接重用。
-ordinal 性質(F0<F1<...<F4)用 Quadratic Weighted Kappa 反映:把 F4 誤判成 F3
-比誤判成 F0 輕,QWK 會據此給不同懲罰,比單看 AUROC 更貼合分期的臨床意義。
+分期是 ordinal(F0<F1<...<F4)→ 用 QWK:把 F4 誤判成 F3 罰得比誤判成 F0 輕,
+比單看 AUROC 更貼合臨床意義。二元任務另外輸出 sensitivity / specificity。
 """
 
 import csv

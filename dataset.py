@@ -1,26 +1,11 @@
-"""資料載入 / transforms / dedup / stratified split。
+"""資料載入 / transforms / dedup / split。
 
-對外只暴露 get_dataloaders(config) -> DataBundle。
+對外只暴露 get_dataloaders(config, fold=None) -> DataBundle。
 
-⚠️ LEAKAGE 警告(務必知道,有兩層):
-
-【第一層:完全重複的影像】(DEDUP=True 可解決)
-  這份公開資料的 6323 個檔案裡,只有 1536 張「位元組不重複」的影像
-  ——平均每張被複製約 4 次,最多的一張出現 18 次。
-  隨機 split 會讓同一張圖的複製品同時落在 train 與 test,模型用背的就滿分
-  (去重前 test macro AUROC = 0.9975,F0/F4 recall = 1.000,正是複製倍率最高的兩類)。
-  → DEDUP=True 依檔案內容 hash 分組,每組只留一張代表,再做 split。
-  好消息:1536 個 hash 全部只對應單一類別,沒有跨類別重複,標籤本身沒有矛盾。
-
-【第二層:patient-level leakage】(這份資料無解)
-  檔名只有「字母前綴 + 流水號」(a1000.jpg / I2079.jpg / z9945.jpg …),沒有病人 ID,
-  前綴字母經抽查也不對應病人,無法做 patient-level split。
-  即使去重後,同一位病人的不同切面/不同幀仍可能分散在不同 split。
-  → 因此本專案的指標仍然「偏樂觀」,不可當成真實臨床表現。
-  切出獨立 test 集只消除「用 val 既選模型又打分」的偏差;
-  DEDUP 只消除「完全重複」的洩漏;patient-level leakage 兩者都消不掉。
-  真正的評估留給未來臨床資料(碩論研究)——屆時把 _dedup_indices 換成
-  依病人 ID 分組的 GroupShuffleSplit 即可。
+⚠️ 這份資料有嚴重的 leakage 與來源混淆,所得指標是樂觀上限而非真實表現。
+   去重(DEDUP)、遮罩消融(MASK)的來龍去脈見 docs/leakage.md。
+   patient-level split 做不到(無病人 ID)—— 臨床資料到手後,把 _dedup_indices
+   換成依病人 ID 分組的 StratifiedGroupKFold 即可,其餘流程不用動。
 """
 
 import hashlib
@@ -47,24 +32,16 @@ class DataBundle:
 
 
 class _Mask:
-    """遮罩消融(confound ablation):把影像的一部分塗黑,看模型還剩多少本事。
+    """把中央方塊(或其補集)塗黑,用來測模型靠組織還是靠來源假影。見 docs/leakage.md。
 
-    背景:F0 去重後 198/199 張都來自 'a' 這個來源,'ct' 前綴只出現在 F1~F3
-    → 來源與類別高度綁定。模型可能只是在「認來源」而非「判讀纖維化」,
-    而這件事**無法從測試分數看出來**(分數本身就被混淆灌水)。
+    "center"     塗黑中央肝實質,只留邊緣/背景
+    "periphery"  塗黑邊緣,只留中央組織
 
-    遮罩後重訓,就能直接證明模型靠什麼吃飯:
-      MASK="center"     塗黑中央(肝實質),只留邊緣/背景。
-                        → 若 recall 仍高 = 模型靠來源假影,混淆確認。
-      MASK="periphery"  塗黑邊緣,只留中央組織。
-                        → 若 recall 仍高 = 模型真的在讀組織,混淆排除。
-
-    在 ToTensor 之後、normalize 之前套用(塗黑 = 填 0 = 原始像素的黑色)。
-    train/eval 都要套同一個遮罩,否則訓練與評估看到的東西不一致。
+    frac = 中央方塊的邊長佔全圖比例。塗黑 = 填 0 = 原始像素的黑色,
+    所以要在 ToTensor 之後、normalize 之前套用。
     """
 
-    def __init__(self, mode, frac=0.35):
-        # frac:中央方塊的邊長佔全圖比例。0.35 → 中央 35% x 35% 的方塊。
+    def __init__(self, mode, frac):
         self.mode, self.frac = mode, frac
 
     def __call__(self, x):          # x: [C,H,W],已 ToTensor,值域 [0,1]
@@ -72,9 +49,9 @@ class _Mask:
         ch, cw = round(h * self.frac), round(w * self.frac)
         top, left = (h - ch) // 2, (w - cw) // 2
         x = x.clone()
-        if self.mode == "center":           # 塗黑中央,只留邊緣
+        if self.mode == "center":
             x[:, top:top + ch, left:left + cw] = 0.0
-        elif self.mode == "periphery":      # 塗黑邊緣,只留中央
+        elif self.mode == "periphery":
             keep = x[:, top:top + ch, left:left + cw].clone()
             x.zero_()
             x[:, top:top + ch, left:left + cw] = keep
@@ -84,10 +61,10 @@ class _Mask:
 
 
 def _build_transforms(config):
-    """train 加 augmentation,val/test 只做必要的 resize + normalize。
+    """train 加 augmentation,val/test 只做 resize + normalize。
 
-    超音波影像的限制:灰階(不動 hue/saturation)、上下方向有意義(不做垂直翻轉)、
-    探頭角度會有小幅變化(允許小角度旋轉)、增益設定因機器而異(允許亮度/對比抖動)。
+    超音波的限制:灰階(不動 hue)、上下方向有意義(不做垂直翻轉)、
+    探頭角度會小幅變化(允許小角度旋轉)、增益因機器而異(允許亮度/對比抖動)。
     """
     normalize = transforms.Normalize(mean=config.MEAN, std=config.STD)
     size = (config.IMG_SIZE, config.IMG_SIZE)
@@ -125,11 +102,7 @@ def _build_transforms(config):
 
 
 def _content_hash(path, chunk_size=1 << 20):
-    """檔案內容的 md5。用來抓「位元組完全相同」的重複影像。
-
-    只抓得到 exact duplicate。同一張圖被重新壓縮 / 縮放過(near-duplicate)hash 會不同
-    → 那要用 _perceptual_hash(DEDUP="perceptual")。
-    """
+    """檔案內容的 md5,抓位元組完全相同的重複。重新壓縮過的近重複抓不到 → _perceptual_hash。"""
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
@@ -138,15 +111,10 @@ def _content_hash(path, chunk_size=1 << 20):
 
 
 def _perceptual_hash(path):
-    """dHash(difference hash):抓「視覺上幾乎相同」但位元組不同的近重複。
+    """dHash:縮到 9x8 灰階、比較相鄰像素亮度 → 64-bit 指紋。抓重新壓縮/縮放過的近重複。
 
-    縮到 9x8 灰階,比較相鄰像素亮度大小 → 64-bit 指紋。對重新壓縮 / 輕微縮放
-    穩定(看的是低頻結構不是像素值)。回傳 bytes 供當 dict key。
-
-    ⚠️ 已知限制:超音波影像都是「黑背景 + 扇形探頭區」,低頻結構相近,
-    偶爾會讓兩張「其實不同組織」的圖(如某些 F0/F4)撞到同一個 dHash。
-    因此 perceptual dedup 只在「同類別內」去重,不跨類別合併,避免把
-    這種哈希碰撞誤刪成跨類別重複。
+    ⚠️ 超音波都是「黑背景 + 扇形區」,低頻結構相近,偶爾會讓兩張「其實不同組織」的圖
+    (F0/F4)撞到同一個 dHash → 所以只在同類別內合併,見 _dedup_indices。
     """
     from PIL import Image  # 延後匯入:只有開 perceptual dedup 才需要
     img = Image.open(path).convert("L").resize((9, 8), Image.BILINEAR)
@@ -156,13 +124,10 @@ def _perceptual_hash(path):
 
 
 def _dedup_indices(samples, mode="exact"):
-    """依內容分組,每組只保留第一個出現的 index(決定性,不受列舉順序影響)。
+    """依內容分組,每組只留第一個出現的 index。
 
-    mode="exact"      md5,只去位元組完全相同的圖
-    mode="perceptual" 先 md5 去 exact,再對代表影像算 dHash 去近重複。
-                      dHash 相同「且同類別」才視為重複(見 _perceptual_hash 的限制)。
-
-    samples 是 ImageFolder.samples,已按路徑排序。
+    samples(= ImageFolder.samples)已按路徑排序 → 「第一個」是決定性的,
+    不受檔案系統列舉順序影響,同一份資料每次跑都得到同一組代表。
     """
     seen = {}
     for i, (path, _) in enumerate(samples):
@@ -174,7 +139,7 @@ def _dedup_indices(samples, mode="exact"):
     if mode != "perceptual":
         raise ValueError(f"未知的 DEDUP 模式: {mode!r};可選 True/'exact'/'perceptual'/False")
 
-    # 在 exact 代表影像之上再去近重複;key 帶 label,確保只在同類別內合併
+    # key 帶 label → 只在同類別內合併,避免 dHash 碰撞誤刪(見 _perceptual_hash)
     seen_p = {}
     for i in exact_idx:
         path, label = samples[i]
@@ -183,10 +148,9 @@ def _dedup_indices(samples, mode="exact"):
 
 
 def _class_weights(labels, num_classes, mode):
-    """依 train split 的類別頻率算權重:w_c = N / (C * n_c),再正規化成平均 1。
+    """w_c = N / (C * n_c),正規化成平均 1 → 少數類權重高。
 
-    少數類權重高。這份資料去重後很平衡,權重接近全 1;
-    留著是為了未來臨床資料(F4 通常遠少於 F0)。
+    這份資料去重後很平衡(權重接近全 1);留著是為了未來臨床資料(通常很不平衡)。
     """
     if mode == "none":
         return None
@@ -194,31 +158,23 @@ def _class_weights(labels, num_classes, mode):
         raise ValueError(f"未知的 CLASS_WEIGHTS: {mode!r};可選 'auto'/'none'")
 
     counts = torch.bincount(torch.tensor(labels), minlength=num_classes).float()
-    # 某類在 train 完全缺漏時,權重設 0 而非 inf(不會有樣本觸發它,但避免 NaN)
+    # 某類在 train 完全缺漏時權重設 0 而非 inf(避免 NaN)
     weights = torch.where(counts > 0, len(labels) / (num_classes * counts.clamp(min=1)),
                           torch.zeros_like(counts))
     return weights / weights[weights > 0].mean()
 
 
 def _map_targets(targets, classes, task):
-    """依 config.TASK 把原始 5 分期 label 轉成目標 label。
-
-    回傳 (mapped_targets, num_classes, class_names)。
-    class_names 供 confusion matrix / 報告顯示用。
-    """
+    """把原始 5 分期 label 轉成目標 label。回傳 (mapped, num_classes, class_names)。"""
     if task == "multiclass":
         return list(targets), len(classes), list(classes)
     if task == "binary_geF2":
-        # F0,F1 -> 0(無顯著纖維化);F2,F3,F4 -> 1(顯著纖維化)
         return [int(t >= 2) for t in targets], 2, ["<F2", ">=F2"]
     raise ValueError(f"未知的 TASK: {task!r}")
 
 
 class _RelabelDataset(Subset):
-    """在 Subset 之上套用 label 轉換(供 binary 等任務切換用)。
-
-    multiclass 時 mapped 與原 label 相同,等同透明包一層。
-    """
+    """Subset + label 轉換。multiclass 時 mapped 與原 label 相同,等同透明包一層。"""
 
     def __init__(self, dataset, indices, mapped_targets):
         super().__init__(dataset, indices)
@@ -226,19 +182,17 @@ class _RelabelDataset(Subset):
 
     def __getitem__(self, i):
         x, _ = super().__getitem__(i)
-        original_index = self.indices[i]
-        return x, self._mapped[original_index]
+        return x, self._mapped[self.indices[i]]
 
     def __getitems__(self, indices):
         return [self.__getitem__(idx) for idx in indices]
 
 
 def _stratified_three_way(indices, labels, val_frac, test_frac, seed, stratify):
-    """先切出 test,再從剩下的切 val,兩者比例皆相對「全體」。
+    """先切 test,再從剩下的切 val;兩者比例皆相對「全體」。
 
-    labels 與 indices 位置對齊(labels[k] 是 indices[k] 的 label)。
-    dedup 後 indices 不再是 0..N-1,所以第二刀要用 index->label 的查表,
-    不能寫成 labels[i]。
+    labels 與 indices 位置對齊。⚠️ 去重後 indices 不再是 0..N-1,
+    所以第二刀要用 index->label 查表,不能寫成 labels[i]。
     """
     label_of = dict(zip(indices, labels))
     strat = labels if stratify else None
@@ -246,8 +200,7 @@ def _stratified_three_way(indices, labels, val_frac, test_frac, seed, stratify):
         indices, test_size=test_frac, random_state=seed,
         shuffle=True, stratify=strat,
     )
-    # val 占全體的 val_frac → 占剩餘的 val_frac / (1 - test_frac)
-    rel_val = val_frac / (1.0 - test_frac)
+    rel_val = val_frac / (1.0 - test_frac)   # val 占全體 val_frac → 占剩餘的這麼多
     strat_tv = [label_of[i] for i in train_val_idx] if stratify else None
     train_idx, val_idx = train_test_split(
         train_val_idx, test_size=rel_val, random_state=seed,
@@ -259,9 +212,7 @@ def _stratified_three_way(indices, labels, val_frac, test_frac, seed, stratify):
 def _kfold_split(indices, labels, fold, n_folds, val_frac, seed):
     """第 fold 折(0-based)當 test,其餘再切出 val。
 
-    n_folds 折輪流當 test → 每張影像剛好被評估一次,合起來就是整份資料的
-    out-of-fold 估計,比單一 split 穩定得多。
-    val 仍占「全體」的 val_frac(從剩下的 1 - 1/n_folds 裡按比例切)。
+    n_folds 折輪流當 test → 每張影像剛好被評估一次,合起來就是全體的 out-of-fold 估計。
     """
     label_of = dict(zip(indices, labels))
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
@@ -270,55 +221,62 @@ def _kfold_split(indices, labels, fold, n_folds, val_frac, seed):
     train_val_idx = [indices[p] for p in train_val_pos]
     test_idx = [indices[p] for p in test_pos]
 
-    rel_val = val_frac / (1.0 - 1.0 / n_folds)
-    strat_tv = [label_of[i] for i in train_val_idx]
+    rel_val = val_frac / (1.0 - 1.0 / n_folds)   # val 仍占全體的 val_frac
     train_idx, val_idx = train_test_split(
         train_val_idx, test_size=rel_val, random_state=seed,
-        shuffle=True, stratify=strat_tv,
+        shuffle=True, stratify=[label_of[i] for i in train_val_idx],
     )
     return train_idx, val_idx, test_idx
 
 
+# 相容布林 True/False,也接受環境變數的字串。
+# ⚠️ env 一律是字串 → "False"/"none" 都是 truthy,不正規化會反而關不掉去重。
+_DEDUP_ALIAS = {
+    True: "exact", "true": "exact", "exact": "exact",
+    "perceptual": "perceptual",
+    False: None, "false": None, "none": None, "": None,
+}
+
+
+def _dedup_mode(value):
+    key = value.lower() if isinstance(value, str) else value
+    if key not in _DEDUP_ALIAS:
+        raise ValueError(f"未知的 DEDUP: {value!r};可選 'exact'/'perceptual'/False")
+    return _DEDUP_ALIAS[key]
+
+
+def _select_indices(train_base, config):
+    """挑出要參與 split 的 index —— 去重後就只剩代表影像。
+
+    因為被丟掉的複製品不會出現在任何 split,所以同一張圖不可能橫跨 train/test。
+    """
+    mode = _dedup_mode(config.DEDUP)
+    if not mode:
+        print("[dataset] ⚠️ DEDUP=False:重複影像會橫跨 train/test,指標將嚴重灌水")
+        return list(range(len(train_base)))
+
+    indices = _dedup_indices(train_base.samples, mode=mode)
+    print(f"[dataset] dedup({mode}): {len(train_base)} 個檔案 -> "
+          f"{len(indices)} 張不重複影像(丟掉 {len(train_base) - len(indices)} 張)")
+    return indices
+
+
 def get_dataloaders(config, fold=None):
-    """回傳 DataBundle。
+    """fold=None → 單一 stratified 三分;fold=0..N-1 → 該折當 test 的 k-fold split。
 
-    fold=None       → 單一 stratified 三分(train/val/test)
-    fold=0..N-1     → k-fold cross-validation 的第 fold 折當 test(見 _kfold_split)
-
-    用兩個共用同一份影像、但 transform 不同的 ImageFolder:
-    train 拿 augmentation 版,val/test 拿 eval 版;再以同一組 stratified
-    索引各自 Subset。
-
-    DEDUP=True 時,split 只在「去重後的代表影像」上做 —— 被丟掉的複製品
-    不會出現在任何 split,所以不可能有同一張圖橫跨 train/test。
+    用兩個共用同一份影像、但 transform 不同的 ImageFolder(train 有 augmentation,
+    val/test 沒有),再以同一組索引各自 Subset。
     """
     train_tf, eval_tf = _build_transforms(config)
-
     train_base = datasets.ImageFolder(config.DATA_DIR, transform=train_tf)
     eval_base = datasets.ImageFolder(config.DATA_DIR, transform=eval_tf)
 
     mapped_targets, num_classes, class_names = _map_targets(
         train_base.targets, train_base.classes, config.TASK)
 
-    # DEDUP 正規化:相容布林 True/False,也接受環境變數傳進來的字串
-    #(env 一律是字串 → "False"/"none" 都是 truthy,不處理會反而關不掉去重)
-    _DEDUP_ALIAS = {True: "exact", "true": "exact", "exact": "exact",
-                    "perceptual": "perceptual",
-                    False: None, "false": None, "none": None, "": None}
-    key = config.DEDUP.lower() if isinstance(config.DEDUP, str) else config.DEDUP
-    if key not in _DEDUP_ALIAS:
-        raise ValueError(f"未知的 DEDUP: {config.DEDUP!r};可選 'exact'/'perceptual'/False")
-    dedup_mode = _DEDUP_ALIAS[key]
-    if dedup_mode:
-        indices = _dedup_indices(train_base.samples, mode=dedup_mode)
-        print(f"[dataset] dedup({dedup_mode}): {len(train_base)} 個檔案 -> "
-              f"{len(indices)} 張不重複影像(丟掉 {len(train_base) - len(indices)} 張)")
-    else:
-        indices = list(range(len(train_base)))
-        print("[dataset] ⚠️ DEDUP=False:重複影像會橫跨 train/test,指標將嚴重灌水")
+    indices = _select_indices(train_base, config)
+    split_labels = [mapped_targets[i] for i in indices]   # 只取這些 index 的 label
 
-    # stratify 要拿「這些 index 對應的 label」,不能整份 mapped_targets 傳進去
-    split_labels = [mapped_targets[i] for i in indices]
     if fold is None:
         train_idx, val_idx, test_idx = _stratified_three_way(
             indices, split_labels,

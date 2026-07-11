@@ -1,26 +1,22 @@
 """模型定義:transfer learning,backbone 可換。
 
-對外暴露:
-  - build_model(num_classes, config) -> nn.Module
-  - set_backbone_trainable(model, config, trainable)   # 凍結/解凍 backbone
-  - param_groups(model, config, backbone_lr, head_lr)  # differential LR 參數分組
+  build_model(num_classes, config) -> nn.Module
+  set_backbone_trainable(model, config, trainable)   # 兩階段微調用
+  param_groups(model, config, backbone_lr, head_lr)  # differential LR
 
-設計上把「特徵抽取(backbone)」與「分類頭(head)」分開,
-之後要做下列擴充時,backbone 那段可以直接重用:
-  - 多模態融合:把影像 feature 與 tabular feature concat 後再進 head
-    (見下方 _replace_head 註解的接入點)
-  - attention-MIL(多視角):同一病人多張影像各自過 backbone 取 feature,
-    再用 attention pooling 聚合成單一向量後進 head
+backbone 與 head 刻意分開,之後擴充可直接重用 backbone:
+  - 多模態融合:影像 feature 與 tabular feature concat 後再進 head
+  - attention-MIL:同一病人多張影像各自過 backbone,attention pooling 後進 head
+接入點在 _replace_head。
 """
 
 import torch.nn as nn
 from torchvision import models
 
 
-# torchvision backbone 對應的 weights enum 與「分類頭屬性名」。
-# 要支援新的 backbone 時,在這裡加一行即可。
-# resnet 的 head 是單一 nn.Linear;efficientnet/convnext 的 head 是 nn.Sequential
-#(裡面還有 Dropout / LayerNorm / Flatten),所以替換要找出最後一層 Linear,見 _replace_head。
+# backbone -> (建構式, 預訓練權重, 分類頭的屬性名)。加新 backbone 就在這裡加一行。
+# resnet 的 head 是單一 Linear;efficientnet/convnext 的是 Sequential(含 Dropout/
+# LayerNorm/Flatten)→ 替換時要找出最後一層 Linear,見 _replace_head。
 _BACKBONES = {
     "resnet18": (models.resnet18, models.ResNet18_Weights.IMAGENET1K_V1, "fc"),
     "resnet34": (models.resnet34, models.ResNet34_Weights.IMAGENET1K_V1, "fc"),
