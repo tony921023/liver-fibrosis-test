@@ -241,8 +241,9 @@ def run_one(data, device, results_dir, ckpt_path):
     print(f"\n結果已存到 {results_dir}/:"
           " metrics.csv, curves.png, confusion_matrix.png, test_report.json")
 
-    # 回傳的內容與存進 json 的完全一致,crossval.py 才拿得到 best_epoch 等欄位
-    return {**report, **extra}
+    # 回傳的 report 內容與存進 json 的完全一致(crossval.py 才拿得到 best_epoch 等欄位);
+    # probs/labels 另外回傳供 crossval 彙總成 out-of-fold 預測(校準 / ROC 要用)。
+    return {**report, **extra}, test_probs, test_labels
 
 
 def main():
@@ -254,7 +255,7 @@ def main():
 
     data = get_dataloaders(config)
     run_one(data, device, config.RESULTS_DIR,
-            os.path.join(config.CKPT_DIR, "best.pt"))
+            os.path.join(config.CKPT_DIR, "best.pt"))   # 單一 split 用不到 probs/labels
 
 
 if __name__ == "__main__":

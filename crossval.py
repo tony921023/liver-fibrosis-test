@@ -12,6 +12,12 @@
 輸出(config.CV_RESULTS_DIR):
   fold_1/ ... fold_N/   每折的 metrics.csv / curves.png / confusion_matrix.png / test_report.json
   cv_summary.json       彙總:每折的指標、mean ± std、彙總後的 confusion matrix
+  oof_predictions.npz   全體影像的 out-of-fold 預測機率 + 真實標籤(供 calibrate.py 用)
+
+out-of-fold 機率為什麼重要:
+每張影像剛好被「沒看過它的那一折模型」預測一次,所以這份機率是全體資料上
+最誠實的預測。校準曲線(reliability diagram)與 ROC/閾值分析都必須建立在
+這份機率上,不能用單一 split 的 test(樣本太少,且與選模型的資料重疊)。
 
 ⚠️ 這裡的 std 是「摺間變異」,反映 split 的不確定性。
    它仍消不掉 patient-level leakage(見 dataset.py 的 LEAKAGE 警告)。
@@ -124,6 +130,7 @@ def main():
     os.makedirs(out_root, exist_ok=True)
 
     reports = []
+    oof_probs, oof_labels, oof_fold = [], [], []
     for fold in range(config.N_FOLDS):
         # 每折重設種子:確保「折與折的差異」只來自 split 本身,
         # 而不是承接上一折留下的 RNG 狀態。
@@ -136,10 +143,27 @@ def main():
         fold_dir = os.path.join(out_root, f"fold_{fold + 1}")
         # 每折存自己的 checkpoint,否則後面的折會覆蓋前面的
         ckpt_path = os.path.join(config.CKPT_DIR, f"cv_fold_{fold + 1}.pt")
-        reports.append(run_one(data, device, fold_dir, ckpt_path))
+        report, probs, labels = run_one(data, device, fold_dir, ckpt_path)
+
+        reports.append(report)
+        # 這一折的 test 是「模型沒看過的」→ 累積起來就是全體的 out-of-fold 預測
+        oof_probs.append(probs)
+        oof_labels.append(labels)
+        oof_fold.append(np.full(len(labels), fold + 1))
 
     summary = _aggregate(reports)
     _print_summary(summary)
+
+    # --- 存 out-of-fold 預測(校準 / ROC / 閾值分析用,見 calibrate.py)---
+    oof_path = os.path.join(out_root, "oof_predictions.npz")
+    np.savez(oof_path,
+             probs=np.concatenate(oof_probs),
+             labels=np.concatenate(oof_labels),
+             fold=np.concatenate(oof_fold),
+             class_names=np.array(summary["class_names"]),
+             task=config.TASK)
+    print(f"out-of-fold 預測已存到 {oof_path}"
+          f"  ({len(np.concatenate(oof_labels))} 張,每張剛好被沒看過它的折預測一次)")
 
     summary_path = os.path.join(out_root, "cv_summary.json")
     with open(summary_path, "w") as f:
