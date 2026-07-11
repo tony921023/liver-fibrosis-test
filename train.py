@@ -232,7 +232,8 @@ def run_one(data, device, results_dir, ckpt_path):
              "aug_strength": config.AUG_STRENGTH,
              "weight_decay": config.WEIGHT_DECAY, "dropout": config.DROPOUT,
              "mixup_alpha": config.MIXUP_ALPHA,
-             "label_smoothing": config.LABEL_SMOOTHING}
+             "label_smoothing": config.LABEL_SMOOTHING,
+             "mask": config.MASK}   # 遮罩消融;"none" 以外的數字不可與正常 run 直接比較
 
     metrics.save_report_json(
         report, os.path.join(results_dir, "test_report.json"), extra=extra)

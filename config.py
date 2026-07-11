@@ -30,6 +30,23 @@ STD = [0.229, 0.224, 0.225]
 # 兩者都消不掉 patient-level leakage(無病人 ID),詳見 dataset.py 的 LEAKAGE 警告。
 DEDUP = os.environ.get("DEDUP", "exact")
 
+# ---- 遮罩消融(confound ablation)----
+# ⚠️ 這份資料的來源與類別高度綁定:perceptual 去重後 F0 有 198/199 張都是 'a' 前綴,
+#    而 'ct' 前綴只出現在 F1~F3。模型可能只是在「認來源」而非「判讀纖維化」——
+#    這件事無法從測試分數看出來(分數本身就被混淆灌水)。
+# 遮罩後重訓,可直接證明模型靠什麼吃飯:
+#   None / "none"  不遮罩(正常訓練)
+#   "center"       塗黑中央肝實質,只留邊緣/背景
+#                  → recall 仍高 = 靠來源假影,混淆確認 🚨
+#   "periphery"    塗黑邊緣,只留中央組織
+#                  → recall 仍高 = 真的在讀組織,混淆排除 ✅
+# 用環境變數切換:  MASK=center python train.py
+MASK = os.environ.get("MASK", "none")
+# 中央方塊的邊長佔全圖比例。0.7 是實測挑的:center-mask 後「非黑組織像素」只剩 5%,
+# 幾乎只留下扇形輪廓/邊界/背景(= 來源特徵)。太小(0.35 只清掉一半)會留下大片組織,
+# 消融就證明不了東西。
+MASK_FRAC = float(os.environ.get("MASK_FRAC", 0.7))
+
 # ---- augmentation 強度 ----
 # "basic"  = resize + 水平翻轉(原本的設定)
 # "strong" = 再加 RandomResizedCrop / 小角度旋轉 / 亮度對比抖動

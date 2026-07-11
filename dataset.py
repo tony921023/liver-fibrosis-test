@@ -46,6 +46,43 @@ class DataBundle:
     class_weights: Optional[torch.Tensor]
 
 
+class _Mask:
+    """遮罩消融(confound ablation):把影像的一部分塗黑,看模型還剩多少本事。
+
+    背景:F0 去重後 198/199 張都來自 'a' 這個來源,'ct' 前綴只出現在 F1~F3
+    → 來源與類別高度綁定。模型可能只是在「認來源」而非「判讀纖維化」,
+    而這件事**無法從測試分數看出來**(分數本身就被混淆灌水)。
+
+    遮罩後重訓,就能直接證明模型靠什麼吃飯:
+      MASK="center"     塗黑中央(肝實質),只留邊緣/背景。
+                        → 若 recall 仍高 = 模型靠來源假影,混淆確認。
+      MASK="periphery"  塗黑邊緣,只留中央組織。
+                        → 若 recall 仍高 = 模型真的在讀組織,混淆排除。
+
+    在 ToTensor 之後、normalize 之前套用(塗黑 = 填 0 = 原始像素的黑色)。
+    train/eval 都要套同一個遮罩,否則訓練與評估看到的東西不一致。
+    """
+
+    def __init__(self, mode, frac=0.35):
+        # frac:中央方塊的邊長佔全圖比例。0.35 → 中央 35% x 35% 的方塊。
+        self.mode, self.frac = mode, frac
+
+    def __call__(self, x):          # x: [C,H,W],已 ToTensor,值域 [0,1]
+        _, h, w = x.shape
+        ch, cw = round(h * self.frac), round(w * self.frac)
+        top, left = (h - ch) // 2, (w - cw) // 2
+        x = x.clone()
+        if self.mode == "center":           # 塗黑中央,只留邊緣
+            x[:, top:top + ch, left:left + cw] = 0.0
+        elif self.mode == "periphery":      # 塗黑邊緣,只留中央
+            keep = x[:, top:top + ch, left:left + cw].clone()
+            x.zero_()
+            x[:, top:top + ch, left:left + cw] = keep
+        else:
+            raise ValueError(f"未知的 MASK: {self.mode!r};可選 'center'/'periphery'/None")
+        return x
+
+
 def _build_transforms(config):
     """train 加 augmentation,val/test 只做必要的 resize + normalize。
 
@@ -71,12 +108,19 @@ def _build_transforms(config):
     else:
         raise ValueError(f"未知的 AUG_STRENGTH: {config.AUG_STRENGTH!r};可選 'basic'/'strong'")
 
-    train_tf = transforms.Compose(train_ops + [transforms.ToTensor(), normalize])
-    eval_tf = transforms.Compose([
-        transforms.Resize(size),
-        transforms.ToTensor(),
-        normalize,
-    ])
+    # 遮罩消融:接在 ToTensor 之後、normalize 之前;train/eval 套用同一個遮罩。
+    # MASK 為 None/"none" 時是空 list,完全不影響原本的行為。
+    mask_ops = []
+    if getattr(config, "MASK", None) and config.MASK != "none":
+        mask_ops = [_Mask(config.MASK, frac=config.MASK_FRAC)]
+        # 遮罩區塊固定在中央,若 train 還做隨機裁切/旋轉,遮罩相對組織的位置會亂跑
+        # → 消融時把 train augmentation 降到 basic,確保兩組實驗只差在「遮罩」。
+        train_ops = [transforms.Resize(size), transforms.RandomHorizontalFlip()]
+
+    train_tf = transforms.Compose(
+        train_ops + [transforms.ToTensor()] + mask_ops + [normalize])
+    eval_tf = transforms.Compose(
+        [transforms.Resize(size), transforms.ToTensor()] + mask_ops + [normalize])
     return train_tf, eval_tf
 
 

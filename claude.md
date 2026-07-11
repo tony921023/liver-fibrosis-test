@@ -34,6 +34,24 @@
   真實 patient-level 評估留給未來臨床資料(屆時把 `dataset._dedup_indices` 換成依病人 ID 的
   `GroupShuffleSplit` 即可)。
 
+- 🚨 **來源混淆(source confounding)—— 比 leakage 更嚴重的問題**:
+  perceptual 去重後,**檔名前綴(= 資料來源)與類別幾乎完全綁定**:
+
+  | 類別 | n | 主要前綴 |
+  |---|---|---|
+  | **F0** | 199 | **`a` 佔 198 張(99.5%)** |
+  | F1 | 288 | `ct` 45 + 雜 |
+  | F2 | 308 | `ct` 128 + 雜 |
+  | F3 | 308 | `ct` 118 + 雜 |
+  | F4 | 285 | `G`/`F`/`J`/`I` 雜(無 `ct`、無 `a`) |
+
+  **F0 ≡ `a` 來源**;`ct` 前綴(926 個 `.png`)只出現在 F1~F3。這份資料是**多來源合併**的,
+  模型只要學會「認來源」(機器型號、前處理、扇形幾何、增益)就能拿到大部分分數。
+  **這無法從測試分數看出來**(分數本身就被混淆灌水),也**無法用子群比較檢驗**
+  (非 `a` 的 F0 只剩 1 張,沒有對照組)。
+  → 用 `config.MASK`(遮罩消融)直接測:塗黑中央組織後若表現仍高 = 靠來源假影。
+    另有 `explain.py` 的 Grad-CAM 稽核作為輔證。
+
 ## 目標結構(請重構成這樣)
 - `dataset.py`:資料載入 / transforms / stratified split
 - `model.py`:模型定義(transfer learning,backbone 可換)
